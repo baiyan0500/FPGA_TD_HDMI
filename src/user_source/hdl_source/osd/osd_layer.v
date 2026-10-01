@@ -22,6 +22,11 @@ module osd_layer #(
     input  wire [1:0]  i_mode,     // 转场模式 0~3
     input  wire [2:0]  i_bright,   // 亮度档 0~4
     input  wire [2:0]  i_contrast, // 对比度档 0~4
+    input  wire [255:0] i_slogan,      // 标语内容（32 字节，标语[0]在最高字节）
+    input  wire [5:0]  i_slogan_len,   // 标语长度 0~32
+    input  wire        i_slogan_dir,   // 滚动方向 0=从右向左 1=从左往右
+    input  wire        i_slogan_update,// 更新 toggle（内容变化时翻转）
+    input  wire        i_slogan_scroll,// 滚动使能
 
     output reg         o_hs,
     output reg         o_vs,
@@ -38,9 +43,9 @@ module osd_layer #(
     localparam BAR_H   = 24;                         // 顶/底栏高度
     localparam GLYPH_Y = (BAR_H - CHAR_H) / 2;       // 栏内字形垂直起点 = 4
 
-    // 顶部标题 "EG4S20 HDMI PLAYER"（18 字符），左对齐
+    // 顶部标语窗口（时间戳左边整行，31 字符），左对齐
     localparam [10:0] TITLE_X   = 11'd8;
-    localparam [4:0]  TITLE_LEN = 5'd18;
+    localparam [5:0]  TITLE_LEN = 6'd31;
 
     // 顶部时间戳 "HH:MM:SS"（8 字符），右对齐
     localparam [3:0]  TS_LEN    = 4'd8;
@@ -111,13 +116,17 @@ module osd_layer #(
         end
     end
 
+    // ---- 滚动位置（标语平滑滚动）----
+    reg [9:0] scroll_pos;
+
     // ---- 顶部标题栏区域 ----
     wire in_bar = (y < BAR_H);
 
     // 标题文字区
     wire [10:0] title_off = x - TITLE_X;
-    wire [4:0]  title_idx = title_off >> 4;
-    wire [2:0]  title_col = (title_off >> 1);
+    wire [10:0] title_off_s = title_off + scroll_pos;   // 内容位置（含滚动偏移）
+    wire [6:0]  title_char_idx = title_off_s >> 4;      // 字符索引
+    wire [2:0]  title_col = (title_off_s >> 1);
     wire [10:0] title_v   = y - GLYPH_Y;
     wire [2:0]  title_row = title_v >> 1;
     wire in_title_x = (x >= TITLE_X) && (x < TITLE_X + TITLE_LEN * CHAR_W);
@@ -145,30 +154,70 @@ module osd_layer #(
     wire in_bot_y = (y >= BOT_GLYPH_Y) && (y < BOT_GLYPH_Y + CHAR_H);
     wire in_bot   = in_bot_bar && in_bot_x && in_bot_y;
 
-    // ---- 标题字符 ROM 索引 ----
+    // ---- 标语锁存（跨域）+ 平滑滚动 ----
+    reg [7:0] slogan [0:31];
+    reg [5:0] slogan_len;
+    wire [5:0] content_chars = (slogan_len > 6'd31) ? slogan_len : 6'd31;
+    reg       slogan_dir;
+    reg       scroll_en;
+    reg [2:0] upd_sync;
+    wire      upd_edge = upd_sync[2] ^ upd_sync[1];
+
+    integer si;
+    always @(posedge i_clk or posedge i_rst) begin
+        if (i_rst) begin
+            upd_sync   <= 3'd0;
+            slogan_len <= 6'd18;
+            slogan_dir <= 1'b0;
+            scroll_en  <= 1'b0;
+            scroll_pos <= 10'd0;
+            // 默认标语 "EG4S20 HDMI PLAYER"
+            slogan[0]  <= "E"; slogan[1]  <= "G"; slogan[2]  <= "4"; slogan[3]  <= "S";
+            slogan[4]  <= "2"; slogan[5]  <= "0"; slogan[6]  <= " "; slogan[7]  <= "H";
+            slogan[8]  <= "D"; slogan[9]  <= "M"; slogan[10] <= "I"; slogan[11] <= " ";
+            slogan[12] <= "P"; slogan[13] <= "L"; slogan[14] <= "A"; slogan[15] <= "Y";
+            slogan[16] <= "E"; slogan[17] <= "R";
+            for (si = 18; si < 32; si = si + 1) slogan[si] <= 8'h00;
+        end else begin
+            upd_sync <= {upd_sync[1:0], i_slogan_update};
+            if (upd_edge) begin
+                slogan_len <= i_slogan_len;
+                slogan_dir <= i_slogan_dir;
+                scroll_en  <= i_slogan_scroll;
+                for (si = 0; si < 32; si = si + 1)
+                    slogan[si] <= i_slogan[(31-si)*8 +: 8];
+                scroll_pos <= 10'd0;
+            end
+            if (scroll_en) begin
+                if (vs_rise) begin
+                    if (slogan_dir == 1'b0) begin
+                        if (scroll_pos >= ({content_chars, 4'd0} - 1'b1))
+                            scroll_pos <= 10'd0;
+                        else
+                            scroll_pos <= scroll_pos + 10'd1;
+                    end else begin
+                        if (scroll_pos == 10'd0)
+                            scroll_pos <= {content_chars, 4'd0} - 1'b1;
+                        else
+                            scroll_pos <= scroll_pos - 10'd1;
+                    end
+                end
+            end else begin
+                scroll_pos <= 10'd0;
+            end
+        end
+    end
+
+    // ---- 标语字符 ROM 索引（内容位置 mod 内容总宽）----
+    wire [6:0] content_chars6 = {1'b0, content_chars};
+    wire [6:0] slogan_idx6 = (title_char_idx >= content_chars6) ? (title_char_idx - content_chars6) : title_char_idx;
+    wire [5:0] slogan_idx = slogan_idx6[5:0];
     reg [6:0] title_char;
     always @(*) begin
-        case (title_idx)
-            5'd0 : title_char = 7'h45;   // E
-            5'd1 : title_char = 7'h47;   // G
-            5'd2 : title_char = 7'h34;   // 4
-            5'd3 : title_char = 7'h53;   // S
-            5'd4 : title_char = 7'h32;   // 2
-            5'd5 : title_char = 7'h30;   // 0
-            5'd6 : title_char = 7'h20;   // (space)
-            5'd7 : title_char = 7'h48;   // H
-            5'd8 : title_char = 7'h44;   // D
-            5'd9 : title_char = 7'h4D;   // M
-            5'd10: title_char = 7'h49;   // I
-            5'd11: title_char = 7'h20;   // (space)
-            5'd12: title_char = 7'h50;   // P
-            5'd13: title_char = 7'h4C;   // L
-            5'd14: title_char = 7'h41;   // A
-            5'd15: title_char = 7'h59;   // Y
-            5'd16: title_char = 7'h45;   // E
-            5'd17: title_char = 7'h52;   // R
-            default: title_char = 7'h20;
-        endcase
+        if (slogan_idx < slogan_len)
+            title_char = slogan[slogan_idx];
+        else
+            title_char = 7'h20;
     end
 
     // ---- 时间戳字符 ROM 索引：HH:MM:SS ----

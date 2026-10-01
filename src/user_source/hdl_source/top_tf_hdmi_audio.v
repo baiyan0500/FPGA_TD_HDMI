@@ -6,6 +6,7 @@ module top(
     input                       k3,             // 对比度调节
     input                       k4,             // 亮度调节
     input  [3:0]                sw,             // SW1~SW4 拨码开关：功能层选择
+    input                       uart_rxd,       // UART 接收（上位机）
 
     output [5:0]                seg_sel,
     output [7:0]                seg_data,
@@ -57,6 +58,13 @@ wire        fade_swap;
 wire [1:0]  ctrl_mode;
 wire [2:0]  ctrl_bright;
 wire [2:0]  ctrl_contrast;
+wire        uart_rx_done;
+wire [7:0]  uart_rx_data;
+wire [255:0] slogan_data;
+wire [5:0]  slogan_len;
+wire        slogan_dir;
+wire        slogan_update;
+wire        slogan_scroll;
 wire        osd_vs;
 wire        osd_de;
 wire [23:0] osd_rgb;
@@ -266,6 +274,30 @@ video_delay video_delay_m0(
 // 首图提交前黑屏；提交后一直显示当前显示缓冲区内容
 assign vout_data = display_valid ? vout_data_raw : 24'd0;
 
+// ===================== UART 上位机标语接收 =====================
+uart_rx #(
+    .CLK_FREQ (50_000_000),
+    .BAUD_RATE(115200)
+) u_uart_rx(
+    .clk     (clk),
+    .rst_n   (~rst_all),
+    .rx      (uart_rxd),
+    .rx_done (uart_rx_done),
+    .rx_data (uart_rx_data)
+);
+
+slogan_ctrl u_slogan_ctrl(
+    .clk      (clk),
+    .rst      (rst_all),
+    .rx_done  (uart_rx_done),
+    .rx_data  (uart_rx_data),
+    .o_slogan (slogan_data),
+    .o_len    (slogan_len),
+    .o_dir    (slogan_dir),
+    .o_update (slogan_update),
+    .o_scroll_en (slogan_scroll)
+);
+
 // ===================== 按键/拨码控制（K1模式 K3对比度 K4亮度 SW层选择）=====================
 ctrl u_ctrl(
     .i_clk      (video_clk),
@@ -311,6 +343,11 @@ osd_layer u_osd_layer(
     .i_bright   (ctrl_bright),
     .i_contrast (ctrl_contrast),
     .i_mode     (ctrl_mode),
+    .i_slogan       (slogan_data),
+    .i_slogan_len   (slogan_len),
+    .i_slogan_dir   (slogan_dir),
+    .i_slogan_update(slogan_update),
+    .i_slogan_scroll(slogan_scroll),
     .o_hs       (),
     .o_vs       (osd_vs),
     .o_de       (osd_de),

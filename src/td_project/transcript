@@ -1,0 +1,10 @@
+# vsim -c -voptargs="+acc" work.tb_slogan -do "run -all; quit -f" 
+# Start time: 11:38:39 on Oct 01,2026
+# ** Note: (vsim-3812) Design is being optimized...
+# 
+# ** Error: (vopt-13130) Failed to find design unit work.tb_slogan.
+# 
+# Optimization failed
+# Error loading design
+# End time: 11:38:39 on Oct 01,2026, Elapsed time: 0:00:00
+# Errors: 1, Warnings: 0
