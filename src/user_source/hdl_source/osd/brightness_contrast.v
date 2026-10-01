@@ -1,34 +1,36 @@
 // ============================================================================
-// brightness_contrast — 亮度/对比度实时调节（拨码开关控制）
+// brightness_contrast — 亮度/对比度实时调节（按键 K3/K4 控制，5 档循环）
 //
-// 插在 video_delay 输出像素流与 OSD 叠加层之间，对视频内容做亮度/对比度调整，
+// 插在 video_delay 输出像素流与 fade 过渡之间，对视频内容做亮度/对比度调整，
 // OSD 文字在它之后生成，因此不受调节影响、始终醒目可读。
 //
-// 映射：拨码 SW1~SW4（拨上=1，拨下=0）
-//   亮度档位   = sw[3:2]（SW4,SW3）：0=-32, 1=0, 2=+32, 3=+64
-//   对比度档位 = sw[1:0]（SW2,SW1）：0=0.75, 1=0.875, 2=1.0, 3=1.125
+// 档位映射（i_bright / i_contrast，0~4）：
+//   亮度偏移：  0=-32, 1=-16, 2=0, 3=+16, 4=+32
+//   对比度系数：0=0.75, 1=0.875, 2=1.0, 3=1.125, 4=1.25
 //
 // 算法（每通道，围绕中点 128）：
 //   x   = in - 128
-//   xc  = x * contrast            （contrast 用移位加减近似：x - x/4、x - x/8、x、x + x/8）
+//   xc  = x * contrast            （对比度用移位加减近似：x±x/4、x±x/8）
 //   sum = xc + 128 + bright
 //   out = clip(sum, 0, 255)
 // ============================================================================
 module brightness_contrast (
-    input  wire [3:0]  i_sw,        // {SW4,SW3,SW2,SW1}
+    input  wire [2:0]  i_bright,    // 亮度档 0~4
+    input  wire [2:0]  i_contrast,  // 对比度档 0~4
     input  wire [23:0] i_rgb,
     output wire [23:0] o_rgb
 );
-    wire [1:0] bright_sel   = i_sw[3:2];
-    wire [1:0] contrast_sel = i_sw[1:0];
+    wire [2:0] bright_sel   = i_bright;
+    wire [2:0] contrast_sel = i_contrast;
 
     reg signed [9:0] bright_off;
     always @(*) begin
         case (bright_sel)
-            2'd0: bright_off = -10'sd32;
-            2'd1: bright_off = 10'sd0;
-            2'd2: bright_off = 10'sd32;
-            default: bright_off = 10'sd64;
+            3'd0: bright_off = -10'sd32;
+            3'd1: bright_off = -10'sd16;
+            3'd2: bright_off = 10'sd0;
+            3'd3: bright_off = 10'sd16;
+            default: bright_off = 10'sd32;
         endcase
     end
 
@@ -43,7 +45,7 @@ endmodule
 // 单通道亮度/对比度（组合逻辑）
 module bc_channel (
     input  wire [7:0] i_pix,
-    input  wire [1:0] i_sel,             // 对比度档位
+    input  wire [2:0] i_sel,             // 对比度档位 0~4
     input  wire signed [9:0] i_bright,   // 亮度偏移（有符号）
     output wire [7:0] o_pix
 );
@@ -52,10 +54,11 @@ module bc_channel (
     reg signed [10:0] xc;
     always @(*) begin
         case (i_sel)
-            2'd0: xc = x - (x >>> 2);        // 0.75
-            2'd1: xc = x - (x >>> 3);        // 0.875
-            2'd2: xc = x;                    // 1.0
-            default: xc = x + (x >>> 3);     // 1.125
+            3'd0: xc = x - (x >>> 2);        // 0.75
+            3'd1: xc = x - (x >>> 3);        // 0.875
+            3'd2: xc = x;                    // 1.0
+            3'd3: xc = x + (x >>> 3);        // 1.125
+            default: xc = x + (x >>> 2);     // 1.25
         endcase
     end
 

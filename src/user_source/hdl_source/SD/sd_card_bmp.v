@@ -3,7 +3,7 @@ module sd_card_bmp #(
     parameter integer CLK_FREQ_HZ       = 100_000_000,
     parameter [31:0]  SCAN_START_SECTOR = 32'd0,
     parameter [31:0]  SCAN_MAX_SECTOR   = 32'd131071,
-    parameter [2:0]   SCAN_TARGET_COUNT = 3'd4
+    parameter [2:0]   SCAN_TARGET_COUNT = 3'd6
 )(
     input                       clk,
     input                       rst,
@@ -56,13 +56,15 @@ reg              first_image_committed;
 reg              auto_play_en;
 reg [31:0]       auto_cnt;
 reg [2:0]        img_found_count;
-reg [1:0]        img_idx;              // 当前真正显示中的图片编号
-reg [1:0]        load_idx;             // 当前正在写入的图片编号
+reg [2:0]        img_idx;              // 当前真正显示中的图片编号
+reg [2:0]        load_idx;             // 当前正在写入的图片编号
 reg [1:0]        pending_buf_idx;      // 当前正在写入的目标缓冲区
 reg [31:0]       img_sector0;
 reg [31:0]       img_sector1;
 reg [31:0]       img_sector2;
 reg [31:0]       img_sector3;
+reg [31:0]       img_sector4;
+reg [31:0]       img_sector5;
 reg              next_req_pending;
 reg              load_busy;
 reg [31:0]       load_timeout_cnt;
@@ -113,28 +115,32 @@ key_press_debounce #(
     .press_pulse(key_auto_press)
 );
 
-function [1:0] next_index_limited;
-    input [1:0] cur;
+function [2:0] next_index_limited;
+    input [2:0] cur;
     input [2:0] count;
     begin
         case (count)
-            3'd0: next_index_limited = 2'd0;
-            3'd1: next_index_limited = 2'd0;
-            3'd2: next_index_limited = (cur == 2'd1) ? 2'd0 : (cur + 2'd1);
-            3'd3: next_index_limited = (cur == 2'd2) ? 2'd0 : (cur + 2'd1);
-            default: next_index_limited = (cur == 2'd3) ? 2'd0 : (cur + 2'd1);
+            3'd0: next_index_limited = 3'd0;
+            3'd1: next_index_limited = 3'd0;
+            3'd2: next_index_limited = (cur == 3'd1) ? 3'd0 : (cur + 3'd1);
+            3'd3: next_index_limited = (cur == 3'd2) ? 3'd0 : (cur + 3'd1);
+            3'd4: next_index_limited = (cur == 3'd3) ? 3'd0 : (cur + 3'd1);
+            3'd5: next_index_limited = (cur == 3'd4) ? 3'd0 : (cur + 3'd1);
+            default: next_index_limited = (cur == 3'd5) ? 3'd0 : (cur + 3'd1);
         endcase
     end
 endfunction
 
 function [31:0] sector_lut;
-    input [1:0] idx;
+    input [2:0] idx;
     begin
         case (idx)
-            2'd0: sector_lut = img_sector0;
-            2'd1: sector_lut = img_sector1;
-            2'd2: sector_lut = img_sector2;
-            2'd3: sector_lut = img_sector3;
+            3'd0: sector_lut = img_sector0;
+            3'd1: sector_lut = img_sector1;
+            3'd2: sector_lut = img_sector2;
+            3'd3: sector_lut = img_sector3;
+            3'd4: sector_lut = img_sector4;
+            3'd5: sector_lut = img_sector5;
             default: sector_lut = img_sector0;
         endcase
     end
@@ -176,6 +182,8 @@ always @(posedge clk or posedge rst) begin
         img_sector1           <= 32'd0;
         img_sector2           <= 32'd0;
         img_sector3           <= 32'd0;
+        img_sector4           <= 32'd0;
+        img_sector5           <= 32'd0;
         next_req_pending      <= 1'b0;
         load_busy             <= 1'b0;
         load_timeout_cnt      <= 32'd0;
@@ -205,6 +213,8 @@ always @(posedge clk or posedge rst) begin
             img_sector1           <= 32'd0;
             img_sector2           <= 32'd0;
             img_sector3           <= 32'd0;
+            img_sector4           <= 32'd0;
+            img_sector5           <= 32'd0;
             next_req_pending      <= 1'b0;
             load_busy             <= 1'b0;
             load_timeout_cnt      <= 32'd0;
@@ -222,10 +232,12 @@ always @(posedge clk or posedge rst) begin
                     3'd1: img_sector1 <= scan_found_sector;
                     3'd2: img_sector2 <= scan_found_sector;
                     3'd3: img_sector3 <= scan_found_sector;
+                    3'd4: img_sector4 <= scan_found_sector;
+                    3'd5: img_sector5 <= scan_found_sector;
                     default: ;
                 endcase
 
-                if (img_found_count < 3'd4)
+                if (img_found_count < 3'd6)
                     img_found_count <= img_found_count + 3'd1;
             end
 
@@ -277,7 +289,7 @@ always @(posedge clk or posedge rst) begin
                 load_timeout_cnt <= 32'd0;
             end
 
-            // 上电后自动发起一次“扫描前 4 张 BMP”
+            // 上电后自动发起一次“扫描前 6 张 BMP”
             if (!scan_kicked && bmp_ready) begin
                 scan_start_pulse      <= 1'b1;
                 scan_kicked           <= 1'b1;

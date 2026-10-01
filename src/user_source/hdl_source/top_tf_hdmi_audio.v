@@ -1,10 +1,11 @@
 
 module top(
     input                       clk,
-    input                       rst_n,
-    input                       key1,           // 手动下一张
-    input                       key2,           // 自动播放 开/关
-    input  [3:0]                sw,             // SW1~SW4 拨码开关：亮度/对比度调节
+    input                       k1,             // 转场模式选择
+    input                       k2,             // 切图（下一张）
+    input                       k3,             // 对比度调节
+    input                       k4,             // 亮度调节
+    input  [3:0]                sw,             // SW1~SW4 拨码开关：功能层选择
 
     output [5:0]                seg_sel,
     output [7:0]                seg_data,
@@ -50,9 +51,12 @@ wire de;
 wire [23:0] vout_data_raw;
 wire [23:0] vout_data;
 wire [23:0] bc_rgb;
-wire [23:0] faded_rgb;
+wire [23:0] trans_rgb;
 wire        fade_req;
 wire        fade_swap;
+wire [1:0]  ctrl_mode;
+wire [2:0]  ctrl_bright;
+wire [2:0]  ctrl_contrast;
 wire        osd_vs;
 wire        osd_de;
 wire [23:0] osd_rgb;
@@ -129,10 +133,7 @@ reg [19:0] rst_cnt = 20'd0;
 reg rst_all_reg = 1'b1;
 
 always @(posedge clk) begin
-    if (!rst_n) begin
-        rst_cnt <= 20'd0;
-        rst_all_reg <= 1'b1;
-    end else if (!rst_all_reg) begin
+    if (!rst_all_reg) begin
         // 一旦复位释放，忽略后续微小的 PLL 抖动，防止系统在使用时随机复位
         rst_all_reg <= 1'b0;
     end else if (sys_pll_lock && video_pll_lock && audio_pll_lock) begin
@@ -196,8 +197,8 @@ sd_card_bmp #(
 ) sd_card_bmp_m0(
     .clk               (sd_card_clk),
     .rst               (rst_all),
-    .key_next          (key1),
-    .key_auto          (key2),
+    .key_next          (k2),
+    .key_auto          (1'b0),
     .state_code        (state_code),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
@@ -226,7 +227,7 @@ seg_decoder seg_decoder_m0(
 
 seg_scan seg_scan_m0(
     .clk               (clk),
-    .rst_n             (rst_n),
+    .rst_n             (~rst_all),
     .seg_sel           (seg_sel),
     .seg_data          (seg_data),
     .seg_data_0        ({1'b1,7'b1111_111}),
@@ -265,34 +266,51 @@ video_delay video_delay_m0(
 // 首图提交前黑屏；提交后一直显示当前显示缓冲区内容
 assign vout_data = display_valid ? vout_data_raw : 24'd0;
 
-// ===================== 亮度/对比度调节（拨码开关 SW1~SW4）=====================
-brightness_contrast u_brightness_contrast(
-    .i_sw   (sw),
-    .i_rgb  (vout_data),
-    .o_rgb  (bc_rgb)
+// ===================== 按键/拨码控制（K1模式 K3对比度 K4亮度 SW层选择）=====================
+ctrl u_ctrl(
+    .i_clk      (video_clk),
+    .i_rst      (rst_all),
+    .i_k1       (k1),
+    .i_k3       (k3),
+    .i_k4       (k4),
+    .i_sw       (sw),
+    .o_mode     (ctrl_mode),
+    .o_bright   (ctrl_bright),
+    .o_contrast (ctrl_contrast)
 );
 
-// ===================== 图片切换淡入淡出过渡 =====================
-fade_ctrl u_fade_ctrl(
+// ===================== 亮度/对比度调节（按键 K3/K4）=====================
+brightness_contrast u_brightness_contrast(
+    .i_bright   (ctrl_bright),
+    .i_contrast (ctrl_contrast),
+    .i_rgb      (vout_data),
+    .o_rgb      (bc_rgb)
+);
+
+// ===================== 图片切换转场（4 种模式）=====================
+transition_ctrl u_transition_ctrl(
     .i_clk  (video_clk),
     .i_rst  (rst_all),
     .i_vs   (vs),
+    .i_de   (de),
+    .i_mode (ctrl_mode),
     .i_rgb  (bc_rgb),
     .i_req  (fade_req),
     .o_swap (fade_swap),
-    .o_rgb  (faded_rgb)
+    .o_rgb  (trans_rgb)
 );
 
-// ===================== OSD 图层叠加（顶部标题栏 + 时间戳 + 亮度/对比度档位）=====================
+// ===================== OSD 图层叠加（标题栏 + 时间戳 + 模式 + 亮度/对比度）=====================
 osd_layer u_osd_layer(
     .i_clk      (video_clk),
     .i_rst      (rst_all),
     .i_hs       (hs),
     .i_vs       (vs),
     .i_de       (de),
-    .i_rgb      (faded_rgb),
-    .i_bright   (sw[3:2]),
-    .i_contrast (sw[1:0]),
+    .i_rgb      (trans_rgb),
+    .i_bright   (ctrl_bright),
+    .i_contrast (ctrl_contrast),
+    .i_mode     (ctrl_mode),
     .o_hs       (),
     .o_vs       (osd_vs),
     .o_de       (osd_de),
