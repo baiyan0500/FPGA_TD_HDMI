@@ -1,0 +1,20 @@
+.DS_Store
+Thumbs.db
+
+# Tool logs
+*.log
+*.logw
+
+# Common temporary and cache files
+*.tmp
+*.bak
+*.swp
+
+# FPGA tool generated outputs
+src/td_project/log/
+src/td_project/work/
+src/td_project/*_Runs/
+src/user_source/hdl_source/work/
+
+# Optional editor/tool state
+src/td_project/.recent_user_depot.ini

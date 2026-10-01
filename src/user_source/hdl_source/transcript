@@ -1,0 +1,39 @@
+# vsim -c -voptargs="+acc" work.tb_bc -do "run -all; quit -f" 
+# Start time: 15:10:51 on Sep 30,2026
+# ** Note: (vsim-3812) Design is being optimized...
+# 
+# //  ModelSim SE-64 10.4 Dec  3 2014 
+# //
+# //  Copyright 1991-2014 Mentor Graphics Corporation
+# //  All Rights Reserved.
+# //
+# //  THIS WORK CONTAINS TRADE SECRET AND PROPRIETARY INFORMATION
+# //  WHICH IS THE PROPERTY OF MENTOR GRAPHICS CORPORATION OR ITS
+# //  LICENSORS AND IS SUBJECT TO LICENSE TERMS.
+# //  THIS DOCUMENT CONTAINS TRADE SECRETS AND COMMERCIAL OR FINANCIAL
+# //  INFORMATION THAT ARE PRIVILEGED, CONFIDENTIAL, AND EXEMPT FROM
+# //  DISCLOSURE UNDER THE FREEDOM OF INFORMATION ACT, 5 U.S.C. SECTION 552.
+# //  FURTHERMORE, THIS INFORMATION IS PROHIBITED FROM DISCLOSURE UNDER
+# //  THE TRADE SECRETS ACT, 18 U.S.C. SECTION 1905.
+# //
+# Loading work.tb_bc(fast)
+# Loading work.brightness_contrast(fast)
+# Loading work.bc_channel(fast)
+# run -all
+# PASS sw=0110 in=808080 out=808080
+# PASS sw=0110 in=000000 out=000000
+# PASS sw=0110 in=ffffff out=ffffff
+# PASS sw=1110 in=000000 out=404040
+# PASS sw=1110 in=c0c0c0 out=ffffff
+# PASS sw=0010 in=101010 out=000000
+# PASS sw=0010 in=808080 out=606060
+# PASS sw=0100 in=808080 out=808080
+# PASS sw=0100 in=000000 out=202020
+# PASS sw=0111 in=808080 out=808080
+# PASS sw=0111 in=000000 out=000000
+# PASS sw=0111 in=ffffff out=ffffff
+# errors=0
+# ** Note: $finish    : C:/FPGA_projects/Contest/tools/tb_bc.v(46)
+#    Time: 120 ns  Iteration: 0  Instance: /tb_bc
+# End time: 15:10:52 on Sep 30,2026, Elapsed time: 0:00:01
+# Errors: 0, Warnings: 0
