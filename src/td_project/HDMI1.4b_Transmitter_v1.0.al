@@ -363,6 +363,14 @@
                     <Attr Name="CompileOrder" Val="51"/>
                 </FileInfo>
             </File>
+            <File Path="../user_source/hdl_source/osd/scaler.v">
+                <FileInfo>
+                    <Attr Name="UsedInSyn" Val="true"/>
+                    <Attr Name="UsedInP&R" Val="true"/>
+                    <Attr Name="BelongTo" Val="design_1"/>
+                    <Attr Name="CompileOrder" Val="52"/>
+                </FileInfo>
+            </File>
         </Verilog>
         <ADC_FILE>
             <File Path="../user_source/constraints_source/pin.adc">

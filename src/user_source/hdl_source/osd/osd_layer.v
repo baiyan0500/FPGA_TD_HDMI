@@ -27,6 +27,8 @@ module osd_layer #(
     input  wire        i_slogan_dir,   // 滚动方向 0=从右向左 1=从左往右
     input  wire        i_slogan_update,// 更新 toggle（内容变化时翻转）
     input  wire        i_slogan_scroll,// 滚动使能
+    input  wire        i_audio_viz,    // 音频可视化使能
+    input  wire [7:0]  i_audio_level,  // 音频电平 0~255
 
     output reg         o_hs,
     output reg         o_vs,
@@ -51,11 +53,11 @@ module osd_layer #(
     localparam [3:0]  TS_LEN    = 4'd8;
     localparam [10:0] TS_X      = H_ACTIVE - TS_LEN * CHAR_W - 8;   // 504
 
-    // 底部信息栏 "MOD:0 B:4 C:4"（13 字符），左对齐
+    // 底部信息栏 "640x480 60FPS MOD:0 B:4 C:4"（27 字符），左对齐
     localparam [10:0] BOT_Y       = V_ACTIVE - BAR_H;               // 456
     localparam [10:0] BOT_GLYPH_Y = BOT_Y + (BAR_H - CHAR_H) / 2;   // 460
     localparam [10:0] BOT_X       = 11'd8;
-    localparam [3:0]  BOT_LEN     = 4'd13;
+    localparam [4:0]  BOT_LEN     = 5'd27;
 
     // ---- 像素位置跟踪 ----
     reg [10:0] x;
@@ -116,6 +118,24 @@ module osd_layer #(
         end
     end
 
+    // ---- FPS 计数器（每秒统计帧数）----
+    reg [9:0] fps_cnt;
+    reg [9:0] fps_val;
+    always @(posedge i_clk or posedge i_rst) begin
+        if (i_rst) begin
+            fps_cnt <= 10'd0;
+            fps_val <= 10'd60;
+        end else begin
+            if (vs_rise) fps_cnt <= fps_cnt + 10'd1;
+            if (cyc_cnt == 25'd24_999_999) begin
+                fps_val <= fps_cnt;
+                fps_cnt <= 10'd0;
+            end
+        end
+    end
+    wire [6:0] fps_tens_char = 7'h30 + (fps_val / 10);
+    wire [6:0] fps_ones_char = 7'h30 + (fps_val % 10);
+
     // ---- 滚动位置（标语平滑滚动）----
     reg [9:0] scroll_pos;
 
@@ -146,13 +166,23 @@ module osd_layer #(
     // ---- 底部信息栏区域 ----
     wire in_bot_bar = (y >= BOT_Y);
     wire [10:0] bot_off = x - BOT_X;
-    wire [3:0]  bot_idx = bot_off >> 4;
+    wire [4:0]  bot_idx = bot_off >> 4;
     wire [2:0]  bot_col = (bot_off >> 1);
     wire [10:0] bot_v   = y - BOT_GLYPH_Y;
     wire [2:0]  bot_row = bot_v >> 1;
     wire in_bot_x = (x >= BOT_X) && (x < BOT_X + BOT_LEN * CHAR_W);
     wire in_bot_y = (y >= BOT_GLYPH_Y) && (y < BOT_GLYPH_Y + CHAR_H);
     wire in_bot   = in_bot_bar && in_bot_x && in_bot_y;
+
+    // ---- 音频可视化（屏幕中心电平条）----
+    localparam [10:0] AV_X = 11'd160;
+    localparam [10:0] AV_Y = 11'd216;
+    localparam [10:0] AV_W = 11'd320;
+    localparam [10:0] AV_H = 11'd24;
+    wire [16:0] av_prod = {9'd0, i_audio_level} * 11'd320;
+    wire [9:0]  av_len  = av_prod[15:8];   // 电平条长度 0~320
+    wire in_av     = i_audio_viz && (x >= AV_X) && (x < AV_X + AV_W) && (y >= AV_Y) && (y < AV_Y + AV_H);
+    wire in_av_bar = in_av && (x < AV_X + {1'b0, av_len});
 
     // ---- 标语锁存（跨域）+ 平滑滚动 ----
     reg [7:0] slogan [0:31];
@@ -236,23 +266,37 @@ module osd_layer #(
         endcase
     end
 
-    // ---- 底部信息字符 ROM 索引：MOD:0 B:4 C:4 ----
+    // ---- 底部信息字符 ROM 索引：640x480 60FPS MOD:0 B:4 C:4 ----
     reg [6:0] bot_char;
     always @(*) begin
         case (bot_idx)
-            4'd0:  bot_char = 7'h4D;                    // M
-            4'd1:  bot_char = 7'h4F;                    // O
-            4'd2:  bot_char = 7'h44;                    // D
-            4'd3:  bot_char = 7'h3A;                    // :
-            4'd4:  bot_char = {3'h3, 2'b00, i_mode};    // '0'+模式
-            4'd5:  bot_char = 7'h20;                    // (space)
-            4'd6:  bot_char = 7'h42;                    // B
-            4'd7:  bot_char = 7'h3A;                    // :
-            4'd8:  bot_char = {3'h3, 1'b0, i_bright};   // '0'+亮度档
-            4'd9:  bot_char = 7'h20;                    // (space)
-            4'd10: bot_char = 7'h43;                    // C
-            4'd11: bot_char = 7'h3A;                    // :
-            4'd12: bot_char = {3'h3, 1'b0, i_contrast}; // '0'+对比度档
+            5'd0:  bot_char = 7'h36;                    // '6'
+            5'd1:  bot_char = 7'h34;                    // '4'
+            5'd2:  bot_char = 7'h30;                    // '0'
+            5'd3:  bot_char = 7'h78;                    // 'x'
+            5'd4:  bot_char = 7'h34;                    // '4'
+            5'd5:  bot_char = 7'h38;                    // '8'
+            5'd6:  bot_char = 7'h30;                    // '0'
+            5'd7:  bot_char = 7'h20;                    // (space)
+            5'd8:  bot_char = fps_tens_char;            // FPS 十位
+            5'd9:  bot_char = fps_ones_char;            // FPS 个位
+            5'd10: bot_char = 7'h46;                    // F
+            5'd11: bot_char = 7'h50;                    // P
+            5'd12: bot_char = 7'h53;                    // S
+            5'd13: bot_char = 7'h20;                    // (space)
+            5'd14: bot_char = 7'h4D;                    // M
+            5'd15: bot_char = 7'h4F;                    // O
+            5'd16: bot_char = 7'h44;                    // D
+            5'd17: bot_char = 7'h3A;                    // :
+            5'd18: bot_char = {3'h3, 2'b00, i_mode};    // '0'+模式
+            5'd19: bot_char = 7'h20;                    // (space)
+            5'd20: bot_char = 7'h42;                    // B
+            5'd21: bot_char = 7'h3A;                    // :
+            5'd22: bot_char = {3'h3, 1'b0, i_bright};   // '0'+亮度档
+            5'd23: bot_char = 7'h20;                    // (space)
+            5'd24: bot_char = 7'h43;                    // C
+            5'd25: bot_char = 7'h3A;                    // :
+            5'd26: bot_char = {3'h3, 1'b0, i_contrast}; // '0'+对比度档
             default: bot_char = 7'h20;
         endcase
     end
@@ -283,6 +327,8 @@ module osd_layer #(
             rgb_next = (title_pixel | ts_pixel) ? 24'hFFFFFF : 24'h000000;
         else if (in_bot_bar)
             rgb_next = bot_pixel ? 24'hFFFFFF : 24'h000000;
+        else if (in_av)
+            rgb_next = in_av_bar ? 24'h00FF00 : 24'h202020;
         else
             rgb_next = i_rgb;
     end

@@ -39,6 +39,7 @@ module transition_ctrl #(
     reg [2:0] state;
     reg [8:0] alpha;                               // 0..256（fade 用）
     reg [10:0] boundary;                           // 0..target（wipe/slide 用）
+    reg        pend_req;                           // S_OUT/S_IN 期间收到的请求锁存，回 IDLE 后处理，防止握手脉冲丢失
 
     reg [2:0] req_sync;
     wire      req_edge = req_sync[2] ^ req_sync[1];
@@ -78,13 +79,18 @@ module transition_ctrl #(
             alpha    <= 9'd256;
             boundary <= 11'd0;
             o_swap   <= 1'b0;
+            pend_req <= 1'b0;
         end else begin
             case (state)
                 S_IDLE: begin
                     alpha <= 9'd256;
-                    if (req_edge) state <= S_OUT;
+                    if (req_edge || pend_req) begin
+                        pend_req <= 1'b0;
+                        state    <= S_OUT;
+                    end
                 end
                 S_OUT: begin
+                    if (req_edge) pend_req <= 1'b1;
                     if (i_mode == 2'd0) begin
                         // 淡出旧图
                         if (vs_rise) begin
@@ -106,6 +112,7 @@ module transition_ctrl #(
                     if (req_edge) state <= S_IN;
                 end
                 S_IN: begin
+                    if (req_edge) pend_req <= 1'b1;
                     if (i_mode == 2'd0) begin
                         // 淡入新图
                         if (vs_rise) begin

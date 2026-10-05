@@ -58,6 +58,9 @@ wire        fade_swap;
 wire [1:0]  ctrl_mode;
 wire [2:0]  ctrl_bright;
 wire [2:0]  ctrl_contrast;
+wire        ctrl_auto_play;
+wire        ctrl_audio_viz;
+wire [7:0]  audio_level;
 wire        uart_rx_done;
 wire [7:0]  uart_rx_data;
 wire [255:0] slogan_data;
@@ -72,6 +75,8 @@ wire        display_valid;
 
 wire [3:0]  state_code;
 wire [6:0]  seg_data_0;
+wire [23:0] shown_bcd;
+wire [6:0]  seg_d0, seg_d1, seg_d2, seg_d3, seg_d4, seg_d5;
 
 wire        video_read_req;
 wire        video_read_req_ack;
@@ -201,12 +206,12 @@ sd_card_bmp #(
     .CLK_FREQ_HZ       (100_000_000),
     .SCAN_START_SECTOR (32'd0),
     .SCAN_MAX_SECTOR   (32'd131071),
-    .SCAN_TARGET_COUNT (3'd4)
+    .SCAN_TARGET_COUNT (3'd6)
 ) sd_card_bmp_m0(
     .clk               (sd_card_clk),
     .rst               (rst_all),
     .key_next          (k2),
-    .key_auto          (1'b0),
+    .key_auto          (ctrl_auto_play),
     .state_code        (state_code),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
@@ -217,6 +222,7 @@ sd_card_bmp #(
     .disp_buf_idx      (disp_buf_idx),
     .fade_swap         (fade_swap),
     .fade_req          (fade_req),
+    .shown_bcd         (shown_bcd),
 
     .write_req         (sd_card_write_req),
     .write_req_ack     (sd_card_write_req_ack),
@@ -228,22 +234,36 @@ sd_card_bmp #(
     .SD_MISO           (sd_miso)
 );
 
-seg_decoder seg_decoder_m0(
-    .bin_data          (state_code),
-    .seg_data          (seg_data_0)
-);
+// 原始逻辑：数码管显示 SD 状态码 state_code（默认）
+seg_decoder seg_decoder_state(.bin_data(state_code), .seg_data(seg_data_0));
+
+// 播放计数 shown_bcd 的 6 位 7 段（SW2 拉高时显示）
+seg_decoder seg_decoder_d0(.bin_data(shown_bcd[3:0]),   .seg_data(seg_d0));
+seg_decoder seg_decoder_d1(.bin_data(shown_bcd[7:4]),   .seg_data(seg_d1));
+seg_decoder seg_decoder_d2(.bin_data(shown_bcd[11:8]),  .seg_data(seg_d2));
+seg_decoder seg_decoder_d3(.bin_data(shown_bcd[15:12]), .seg_data(seg_d3));
+seg_decoder seg_decoder_d4(.bin_data(shown_bcd[19:16]), .seg_data(seg_d4));
+seg_decoder seg_decoder_d5(.bin_data(shown_bcd[23:20]), .seg_data(seg_d5));
+
+// 显示选择：SW2 拉高 = 播放计数；否则 = 原始 state_code（第 6 位显示，其余灭）
+wire [6:0] disp0 = sw[1] ? seg_d0      : 7'b111_1111;
+wire [6:0] disp1 = sw[1] ? seg_d1      : 7'b111_1111;
+wire [6:0] disp2 = sw[1] ? seg_d2      : 7'b111_1111;
+wire [6:0] disp3 = sw[1] ? seg_d3      : 7'b111_1111;
+wire [6:0] disp4 = sw[1] ? seg_d4      : 7'b111_1111;
+wire [6:0] disp5 = sw[1] ? seg_d5      : seg_data_0;
 
 seg_scan seg_scan_m0(
     .clk               (clk),
     .rst_n             (~rst_all),
     .seg_sel           (seg_sel),
     .seg_data          (seg_data),
-    .seg_data_0        ({1'b1,7'b1111_111}),
-    .seg_data_1        ({1'b1,7'b1111_111}),
-    .seg_data_2        ({1'b1,7'b1111_111}),
-    .seg_data_3        ({1'b1,7'b1111_111}),
-    .seg_data_4        ({1'b1,7'b1111_111}),
-    .seg_data_5        ({1'b1,seg_data_0})
+    .seg_data_0        ({1'b1,disp0}),
+    .seg_data_1        ({1'b1,disp1}),
+    .seg_data_2        ({1'b1,disp2}),
+    .seg_data_3        ({1'b1,disp3}),
+    .seg_data_4        ({1'b1,disp4}),
+    .seg_data_5        ({1'b1,disp5})
 );
 
 // ===================== 原图像时序与帧缓存 =====================
@@ -308,8 +328,39 @@ ctrl u_ctrl(
     .i_sw       (sw),
     .o_mode     (ctrl_mode),
     .o_bright   (ctrl_bright),
-    .o_contrast (ctrl_contrast)
+    .o_contrast (ctrl_contrast),
+    .o_auto_play(ctrl_auto_play),
+    .o_audio_viz(ctrl_audio_viz)
 );
+
+// ===================== 音频幅度提取 + 峰值保持（audio_mclk 域）=====================
+reg [7:0]  audio_amp;
+reg [7:0]  audio_peak;
+reg [15:0] audio_peak_cnt;
+always @(posedge audio_mclk or posedge rst_all) begin
+    if (rst_all) begin
+        audio_amp <= 8'd0; audio_peak <= 8'd0; audio_peak_cnt <= 16'd0;
+    end else begin
+        audio_amp <= audio_left_data[23] ? (~audio_left_data[22:15] + 8'd1) : audio_left_data[22:15];
+        if (audio_amp > audio_peak)
+            audio_peak <= audio_amp;
+        else if (audio_peak_cnt == 16'd0)
+            audio_peak <= (audio_peak == 8'd0) ? 8'd0 : audio_peak - 8'd1;
+        audio_peak_cnt <= audio_peak_cnt + 16'd1;
+    end
+end
+
+// 跨域到 video_clk（2 级同步）
+reg [7:0] audio_peak_s1, audio_peak_s2;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        audio_peak_s1 <= 8'd0; audio_peak_s2 <= 8'd0;
+    end else begin
+        audio_peak_s1 <= audio_peak;
+        audio_peak_s2 <= audio_peak_s1;
+    end
+end
+assign audio_level = audio_peak_s2;
 
 // ===================== 亮度/对比度调节（按键 K3/K4）=====================
 brightness_contrast u_brightness_contrast(
@@ -348,6 +399,8 @@ osd_layer u_osd_layer(
     .i_slogan_dir   (slogan_dir),
     .i_slogan_update(slogan_update),
     .i_slogan_scroll(slogan_scroll),
+    .i_audio_viz(ctrl_audio_viz),
+    .i_audio_level(audio_level),
     .o_hs       (),
     .o_vs       (osd_vs),
     .o_de       (osd_de),

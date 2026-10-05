@@ -22,6 +22,9 @@ module bmp_read(
     output reg [3:0]            state_code,
     input  [15:0]               bmp_width,
     input  [15:0]               bmp_height,
+    output [15:0]               src_width,     // 实际图片宽（缩放源）
+    output [15:0]               src_height,    // 实际图片高
+    input                       i_stall,       // 背压：暂停读取（scaler FIFO 快满时）
 
     output reg                  write_req,
     input                       write_req_ack,
@@ -68,10 +71,10 @@ wire [31:0] next_scan_sector_if_miss;
 assign ready = (state == ST_IDLE);
 assign header_match = (header_0 == "B") &&
                       (header_1 == "M") &&
-                      (width[15:0]  == bmp_width) &&
-                      (height[15:0] == bmp_height) &&
                       (bit_count    == 16'd24) &&
                       (compression  == 32'd0);
+assign src_width  = width[15:0];
+assign src_height = height[15:0];
 assign bmp_data_valid = (sd_sec_read_data_valid == 1'b1) &&
                         (bmp_len_cnt >= pixel_offset) &&
                         (bmp_len_cnt <  file_len);
@@ -205,7 +208,7 @@ always @(posedge clk or posedge rst) begin
         scan_found_total  <= 3'd0;
         scan_sector       <= 32'd0;
         load_sector_latched <= 32'd0;
-    end else if (!sd_init_done || load_abort) begin
+    end else if (!sd_init_done) begin
         state             <= ST_IDLE;
         state_code        <= 4'd0;
         sd_sec_read       <= 1'b0;
@@ -216,6 +219,15 @@ always @(posedge clk or posedge rst) begin
         scan_found_sector <= 32'd0;
         scan_found_total  <= 3'd0;
         scan_sector       <= 32'd0;
+        load_sector_latched <= 32'd0;
+    end else if (load_abort) begin
+        // 仅中止当前装载，保留扫描成果（scan_done 等），否则一次坏图超时就永久报废切图功能
+        state             <= ST_IDLE;
+        state_code        <= 4'd0;
+        sd_sec_read       <= 1'b0;
+        sd_sec_read_addr  <= 32'd0;
+        write_req         <= 1'b0;
+        scan_found_valid  <= 1'b0;
         load_sector_latched <= 32'd0;
     end else begin
         scan_found_valid <= 1'b0;
@@ -298,10 +310,13 @@ always @(posedge clk or posedge rst) begin
 
             ST_LOAD_DATA: begin
                 state_code  <= 4'd4;
-                sd_sec_read <= 1'b1;
+                if (i_stall) begin
+                    sd_sec_read <= 1'b0;   // 背压暂停
+                end else begin
+                    sd_sec_read <= 1'b1;
+                end
 
                 if (sd_sec_read_end) begin
-                    sd_sec_read <= 1'b0;
                     if (bmp_len_cnt >= file_len) begin
                         state <= ST_IDLE;
                     end else begin

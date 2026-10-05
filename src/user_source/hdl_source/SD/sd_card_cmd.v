@@ -204,10 +204,20 @@ begin
 					state <= S_READ;
 					byte_cnt <= 16'd0;
 				end
+				else if(spi_wr_ack == 1'b1 && byte_cnt >= 16'd8191)
+				begin
+					// token 等待超时（约 2.6ms @ 25MHz SPI）：SD 卡偶发无响应时放弃死等，
+					// 走 S_ERR 让上层（sd_card_sec_read_write 的 S_CMD17）自动重发命令重读
+					spi_wr_req <= 1'b0;
+					byte_cnt   <= 16'd0;
+					state      <= S_ERR;
+				end
 				else
 				begin
 					spi_wr_req <= 1'b1;
-					send_data <= 8'hff;
+					send_data  <= 8'hff;
+					if(spi_wr_ack == 1'b1)
+						byte_cnt <= byte_cnt + 16'd1;
 				end
 			end
 			S_READ:

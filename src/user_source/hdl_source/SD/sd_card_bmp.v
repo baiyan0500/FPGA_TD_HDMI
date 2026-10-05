@@ -19,6 +19,7 @@ module sd_card_bmp #(
     output reg [1:0]            disp_buf_idx,
     input                       fade_swap,       // 淡出完成 toggle（video_clk 域，跨域同步）
     output reg                  fade_req,        // 过渡请求 toggle（给 fade_ctrl）
+    output reg [23:0]           shown_bcd,       // 已播放图片张数（6 位 BCD）
 
     output                      write_req,
     input                       write_req_ack,
@@ -31,7 +32,8 @@ module sd_card_bmp #(
 );
 
 wire key_next_press;
-wire key_auto_press;
+reg [2:0] auto_play_sync;
+wire      auto_play_level = auto_play_sync[2];
 
 wire             sd_sec_read;
 wire [31:0]      sd_sec_read_addr;
@@ -41,6 +43,11 @@ wire             sd_sec_read_end;
 wire [3:0]       state_code_i;
 wire             bmp_data_wr_en;
 wire [23:0]      bmp_data;
+wire [15:0]      src_width;
+wire [15:0]      src_height;
+wire             scale_wr_en;
+wire [23:0]      scale_data;
+wire             scale_almost_full;
 wire             sd_init_done;
 wire             bmp_ready;
 wire             scan_done;
@@ -75,6 +82,11 @@ reg              load_abort;
 reg              source_done_seen;
 reg              write_done_seen;
 reg              swap_pending;         // 正在等待淡出完成（fade_swap 边沿）
+reg              img_shown_pulse;      // 切图脉冲（播放计数 +1）
+reg              load_active_seen;     // bmp_read 已真正离开 IDLE（装载确实启动过）
+reg              wr_req_seen;          // 本次装载已发出 write_req（header 匹配过）
+reg [2:0]        fail_idx;             // 最近一次装载失败的图片索引
+reg              fail_valid;           // fail_idx 有效：下次切图从它的下一张继续尝试
 
 // 同步 mem_clk 域的 write_finish_toggle
 reg [2:0]        wrfin_tgl_sync;
@@ -85,12 +97,14 @@ reg [2:0]        fade_swap_sync;
 wire             fade_swap_edge;
 
 wire auto_tick;
-wire [1:0] next_from_current;
+wire [2:0] next_base;        // 切图基准：上次失败的图 → 从它继续，否则从当前显示图继续
+wire [2:0] next_from_current;
 
-assign write_en   = bmp_data_wr_en;
-assign write_data = {bmp_data[23:16], bmp_data[15:8], bmp_data[7:0], 8'b0};
-assign auto_tick  = (auto_cnt == (CLK_FREQ_HZ - 1));
-assign next_from_current = next_index_limited(img_idx, img_found_count);
+assign write_en   = scale_wr_en;
+assign write_data = {scale_data[23:16], scale_data[15:8], scale_data[7:0], 8'b0};
+assign auto_tick  = (auto_cnt == (CLK_FREQ_HZ - 1));   // 1 秒间隔
+assign next_base        = fail_valid ? fail_idx : img_idx;
+assign next_from_current = next_index_limited(next_base, img_found_count);
 assign write_finish_pulse = wrfin_tgl_sync[2] ^ wrfin_tgl_sync[1];
 assign fade_swap_edge      = fade_swap_sync[2] ^ fade_swap_sync[1];
 assign state_code = state_code_i;
@@ -105,15 +119,13 @@ key_press_debounce #(
     .press_pulse(key_next_press)
 );
 
-key_press_debounce #(
-    .CLK_FREQ_HZ (CLK_FREQ_HZ),
-    .DEBOUNCE_MS (50)
-) u_key_auto (
-    .clk        (clk),
-    .rst        (rst),
-    .button_in  (key_auto),
-    .press_pulse(key_auto_press)
-);
+// key_auto 现在是从 ctrl 来的"自动播放电平"（跨域），3 级同步即可，无需去抖
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        auto_play_sync <= 3'd0;
+    else
+        auto_play_sync <= {auto_play_sync[1:0], key_auto};
+end
 
 function [2:0] next_index_limited;
     input [2:0] cur;
@@ -191,12 +203,17 @@ always @(posedge clk or posedge rst) begin
         source_done_seen      <= 1'b0;
         write_done_seen       <= 1'b0;
         display_valid         <= 1'b0;
+        load_active_seen      <= 1'b0;
+        wr_req_seen           <= 1'b0;
+        fail_idx              <= 3'd0;
+        fail_valid            <= 1'b0;
     end else begin
         wrfin_tgl_sync   <= {wrfin_tgl_sync[1:0], write_finish_toggle};
         fade_swap_sync   <= {fade_swap_sync[1:0], fade_swap};
         scan_start_pulse <= 1'b0;
         load_start_pulse <= 1'b0;
         load_abort       <= 1'b0;
+        img_shown_pulse  <= 1'b0;
 
         if (!sd_init_done) begin
             scan_kicked           <= 1'b0;
@@ -224,6 +241,10 @@ always @(posedge clk or posedge rst) begin
             swap_pending          <= 1'b0;
             fade_req              <= 1'b0;
             display_valid         <= 1'b0;
+            load_active_seen      <= 1'b0;
+            wr_req_seen           <= 1'b0;
+            fail_idx              <= 3'd0;
+            fail_valid            <= 1'b0;
         end else begin
             // 扫描阶段缓存前 4 张图的起始 sector
             if (scan_found_valid) begin
@@ -241,9 +262,24 @@ always @(posedge clk or posedge rst) begin
                     img_found_count <= img_found_count + 3'd1;
             end
 
-            // 记住 bmp_read 已经把源图送完 FIFO，但还不能切显示，得等整帧写完
-            if (load_busy && bmp_ready)
-                source_done_seen <= 1'b1;
+            // 装载确实启动过（bmp_read 离开过 IDLE）、且发出过 write_req（header 匹配），
+            // bmp_read 回到 IDLE 才算"源图送完"。修复装载启动瞬间 bmp_ready 尚为 1 导致的误置位
+            if (load_busy && !bmp_ready)
+                load_active_seen <= 1'b1;
+            if (load_busy && write_req)
+                wr_req_seen <= 1'b1;
+
+            if (load_busy && load_active_seen && bmp_ready && !swap_pending && !load_start_pulse) begin
+                if (wr_req_seen)
+                    source_done_seen <= 1'b1;   // 源读完，等整帧写完
+                else begin
+                    // header 不匹配（坏图）：立即放弃，不等 1s 超时；下次切图自动跳到下一张
+                    load_busy   <= 1'b0;
+                    load_abort  <= 1'b1;
+                    fail_idx    <= load_idx;
+                    fail_valid  <= 1'b1;
+                end
+            end
 
             // 记住写帧完成脉冲，避免“先写完后源结束”导致脉冲丢失而卡死
             if (load_busy && write_finish_pulse)
@@ -260,6 +296,8 @@ always @(posedge clk or posedge rst) begin
                 img_idx               <= load_idx;
                 display_valid         <= 1'b1;
                 first_image_committed <= 1'b1;
+                img_shown_pulse       <= 1'b1;
+                fail_valid            <= 1'b0;
             end else if (load_busy && source_done_seen && write_done_seen && first_image_committed && !swap_pending) begin
                 // 后续切图：先触发淡出，等 fade_swap 边沿再切显示缓冲
                 source_done_seen <= 1'b0;
@@ -274,14 +312,21 @@ always @(posedge clk or posedge rst) begin
                 disp_buf_idx     <= pending_buf_idx;
                 img_idx          <= load_idx;
                 fade_req         <= ~fade_req;      // 请求淡入
-            end else if (load_busy && !swap_pending) begin
-                if (load_timeout_cnt > 32'd100_000_000) begin
+                img_shown_pulse  <= 1'b1;
+                fail_valid       <= 1'b0;
+            end else if (load_busy) begin
+                // 超时覆盖 swap_pending：防止 fade 握手丢失时 swap_pending 永久挂起导致 K2 彻底失效。
+                // 2s 阈值 > 最坏正常时长（装载约 0.5s + fade 全程转场约 0.54s）
+                if (load_timeout_cnt > 32'd200_000_000) begin
                     // 超时（例如读到坏图或截断的文件导致死锁），强制释放 busy 以恢复按键响应
                     load_busy             <= 1'b0;
                     load_timeout_cnt      <= 32'd0;
                     source_done_seen      <= 1'b0;
                     write_done_seen       <= 1'b0;
                     load_abort            <= 1'b1;
+                    swap_pending          <= 1'b0;
+                    fail_idx              <= load_idx;
+                    fail_valid            <= 1'b1;
                 end else begin
                     load_timeout_cnt <= load_timeout_cnt + 32'd1;
                 end
@@ -312,11 +357,10 @@ always @(posedge clk or posedge rst) begin
                 if (key_next_press && scan_done && (img_found_count > 3'd0))
                     next_req_pending <= 1'b1;
 
-                // 自动播放开/关
-                if (key_auto_press && scan_done && (img_found_count > 3'd1)) begin
-                    auto_play_en <= ~auto_play_en;
-                    auto_cnt     <= 32'd0;
-                end
+                // 自动播放开/关（电平控制，来自 ctrl 的 o_auto_play）
+                if (auto_play_level != auto_play_en)
+                    auto_cnt <= 32'd0;
+                auto_play_en <= auto_play_level;
 
                 // 自动播放 1s 计数：只有当前没有写图任务时才计时
                 if (scan_done && auto_play_en && display_valid && !load_busy && first_image_committed && (img_found_count > 3'd1)) begin
@@ -328,16 +372,19 @@ always @(posedge clk or posedge rst) begin
                     auto_cnt <= 32'd0;
                 end
 
-                // 首图自动加载到 buffer0
+                // 首图自动加载到 buffer0（若首图坏则沿 fail 链继续尝试后续图片）
                 if (scan_done && !first_image_committed && bmp_ready && !load_busy && (img_found_count != 3'd0)) begin
-                    load_idx         <= 2'd0;
-                    load_sector      <= img_sector0;
+                    load_idx         <= fail_valid ? next_from_current : 3'd0;
+                    load_sector      <= fail_valid ? sector_lut(next_from_current) : img_sector0;
                     pending_buf_idx  <= 2'd0;
                     write_buf_idx    <= 2'd0;
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
                     write_done_seen  <= 1'b0;
+                    load_active_seen <= 1'b0;
+                    wr_req_seen      <= 1'b0;
+                    fail_valid       <= 1'b0;
                     next_req_pending <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
@@ -351,6 +398,9 @@ always @(posedge clk or posedge rst) begin
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
                     write_done_seen  <= 1'b0;
+                    load_active_seen <= 1'b0;
+                    wr_req_seen      <= 1'b0;
+                    fail_valid       <= 1'b0;
                     next_req_pending <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
@@ -364,6 +414,9 @@ always @(posedge clk or posedge rst) begin
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
                     write_done_seen  <= 1'b0;
+                    load_active_seen <= 1'b0;
+                    wr_req_seen      <= 1'b0;
+                    fail_valid       <= 1'b0;
                     auto_cnt         <= 32'd0;
                 end
             end
@@ -401,7 +454,24 @@ bmp_read bmp_read_m0(
     .sd_sec_read_data_valid (sd_sec_read_data_valid),
     .sd_sec_read_end        (sd_sec_read_end),
     .bmp_data_wr_en         (bmp_data_wr_en),
-    .bmp_data               (bmp_data)
+    .bmp_data               (bmp_data),
+    .src_width              (src_width),
+    .src_height             (src_height),
+    .i_stall                (scale_almost_full)
+);
+
+scaler u_scaler(
+    .clk         (clk),
+    .rst         (rst),
+    .start       (write_req_ack),
+    .src_w       (src_width),
+    .src_h       (src_height),
+    .src_en      (bmp_data_wr_en),
+    .src_data    (bmp_data),
+    .almost_full (scale_almost_full),
+    .dst_en      (scale_wr_en),
+    .dst_data    (scale_data),
+    .done        ()
 );
 
 sd_card_top sd_card_top_m0(
@@ -423,6 +493,34 @@ sd_card_top sd_card_top_m0(
     .sd_sec_write_data_req  (),
     .sd_sec_write_end       ()
 );
+
+// ---- 播放次数 BCD 加 1（6 位 BCD）----
+wire [3:0] bcd_d0 = shown_bcd[3:0];
+wire [3:0] bcd_d1 = shown_bcd[7:4];
+wire [3:0] bcd_d2 = shown_bcd[11:8];
+wire [3:0] bcd_d3 = shown_bcd[15:12];
+wire [3:0] bcd_d4 = shown_bcd[19:16];
+wire [3:0] bcd_d5 = shown_bcd[23:20];
+
+wire bcd_c0 = (bcd_d0 == 4'd9);
+wire bcd_c1 = (bcd_d1 == 4'd9) & bcd_c0;
+wire bcd_c2 = (bcd_d2 == 4'd9) & bcd_c1;
+wire bcd_c3 = (bcd_d3 == 4'd9) & bcd_c2;
+wire bcd_c4 = (bcd_d4 == 4'd9) & bcd_c3;
+
+wire [3:0] bcd_n0 = bcd_c0 ? 4'd0 : bcd_d0 + 4'd1;
+wire [3:0] bcd_n1 = bcd_c0 ? (bcd_c1 ? 4'd0 : bcd_d1 + 4'd1) : bcd_d1;
+wire [3:0] bcd_n2 = bcd_c1 ? (bcd_c2 ? 4'd0 : bcd_d2 + 4'd1) : bcd_d2;
+wire [3:0] bcd_n3 = bcd_c2 ? (bcd_c3 ? 4'd0 : bcd_d3 + 4'd1) : bcd_d3;
+wire [3:0] bcd_n4 = bcd_c3 ? (bcd_c4 ? 4'd0 : bcd_d4 + 4'd1) : bcd_d4;
+wire [3:0] bcd_n5 = bcd_c4 ? ((bcd_d5 == 4'd9) ? 4'd0 : bcd_d5 + 4'd1) : bcd_d5;
+
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        shown_bcd <= 24'd0;
+    else if (img_shown_pulse)
+        shown_bcd <= {bcd_n5, bcd_n4, bcd_n3, bcd_n2, bcd_n1, bcd_n0};
+end
 
 endmodule
 
