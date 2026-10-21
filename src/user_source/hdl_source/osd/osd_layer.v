@@ -1,13 +1,10 @@
 // ============================================================================
 // osd_layer — 字符 OSD 叠加层（单级流水）
 //
-// 插在 transition_ctrl 输出像素流与 video_rgb_to_axis_640x480 之间。
-// 顶部标题栏：左侧标题文字，右侧 24 小时制时间戳。
-// 底部信息栏：转场模式 MOD:x、亮度档 B:x、对比度档 C:x（x 为档位号 0~4）。
-//
-// 关键点：整条路径只有一级寄存器（o_hs/o_vs/o_de/o_rgb 同拍），因此 RGB 与
-//        同步信号的延迟完全一致，插入后不会造成画面错位/撕裂。
-// 字库：font8x8（8x8 点阵），2x 放大到 16x16 像素显示。
+// 正常显示：顶部标语 + 时间戳、底部信息栏、VU 电平条、32 段频谱。
+// 启动阶段（首图提交前）：左面板标题/跑马灯/进度，右面板按键功能说明。
+// 顶/底栏布局与显示逻辑保持不变；标语仅显示 ASCII 可打印字符，避免乱码。
+// 字库 font8x8：正常文本 2x，开机标题 4x，功能说明 1x。
 // ============================================================================
 module osd_layer #(
     parameter H_ACTIVE = 640,
@@ -30,7 +27,12 @@ module osd_layer #(
     input  wire        i_audio_viz,    // 音频可视化使能
     input  wire [7:0]  i_audio_level,  // 音频电平 0~255
     input  wire        i_spectrum_en,  // 频谱图显示使能（层3 K4）
-    input  wire [47:0] i_spec_level,   // 8 频段 × 6bit 电平
+    input  wire [191:0] i_spec_level,  // 32 频段 × 6bit 电平
+    input  wire        i_display_valid,// 首图已提交（隐藏启动面板）
+    input  wire        i_sd_init_done,
+    input  wire        i_scan_done,
+    input  wire [2:0]  i_img_count,    // 扫描到的图片数
+    input  wire        i_auto_play,    // 自动轮播状态
 
     output reg         o_hs,
     output reg         o_vs,
@@ -38,24 +40,18 @@ module osd_layer #(
     output reg  [23:0] o_rgb
 );
 
-    // ---- 布局常量（像素）----
-    localparam SCALE   = 2;                          // 字符放大倍数（2 → 16x16）
-    localparam GLYPH_W = 8;
-    localparam GLYPH_H = 8;
-    localparam CHAR_W  = GLYPH_W * SCALE;            // 16
-    localparam CHAR_H  = GLYPH_H * SCALE;            // 16
-    localparam BAR_H   = 24;                         // 顶/底栏高度
-    localparam GLYPH_Y = (BAR_H - CHAR_H) / 2;       // 栏内字形垂直起点 = 4
+    // ---- 上下栏布局（保持不变）----
+    localparam CHAR_W  = 16;
+    localparam CHAR_H  = 16;
+    localparam BAR_H   = 24;
+    localparam GLYPH_Y = 4;
 
-    // 顶部标语窗口（时间戳左边整行，31 字符），左对齐
     localparam [10:0] TITLE_X   = 11'd8;
     localparam [5:0]  TITLE_LEN = 6'd31;
 
-    // 顶部时间戳 "HH:MM:SS"（8 字符），右对齐
     localparam [3:0]  TS_LEN    = 4'd8;
     localparam [10:0] TS_X      = H_ACTIVE - TS_LEN * CHAR_W - 8;   // 504
 
-    // 底部信息栏 "640x480 60FPS MOD:0 B:4 C:4"（27 字符），左对齐
     localparam [10:0] BOT_Y       = V_ACTIVE - BAR_H;               // 456
     localparam [10:0] BOT_GLYPH_Y = BOT_Y + (BAR_H - CHAR_H) / 2;   // 460
     localparam [10:0] BOT_X       = 11'd8;
@@ -120,7 +116,7 @@ module osd_layer #(
         end
     end
 
-    // ---- FPS 计数器（每秒统计帧数）----
+    // ---- FPS 计数器 ----
     reg [9:0] fps_cnt;
     reg [9:0] fps_val;
     always @(posedge i_clk or posedge i_rst) begin
@@ -138,99 +134,13 @@ module osd_layer #(
     wire [6:0] fps_tens_char = 7'h30 + (fps_val / 10);
     wire [6:0] fps_ones_char = 7'h30 + (fps_val % 10);
 
-    // ---- 滚动位置（标语平滑滚动）----
-    reg [9:0] scroll_pos;
-
-    // ---- 顶部标题栏区域 ----
-    wire in_bar = (y < BAR_H);
-
-    // 标题文字区
-    wire [10:0] title_off = x - TITLE_X;
-    wire [10:0] title_off_s = title_off + scroll_pos;   // 内容位置（含滚动偏移）
-    wire [6:0]  title_char_idx = title_off_s >> 4;      // 字符索引
-    wire [2:0]  title_col = (title_off_s >> 1);
-    wire [10:0] title_v   = y - GLYPH_Y;
-    wire [2:0]  title_row = title_v >> 1;
-    wire in_title_x = (x >= TITLE_X) && (x < TITLE_X + TITLE_LEN * CHAR_W);
-    wire in_title_y = (y >= GLYPH_Y) && (y < GLYPH_Y + CHAR_H);
-    wire in_title   = in_bar && in_title_x && in_title_y;
-
-    // 时间戳文字区
-    wire [10:0] ts_off  = x - TS_X;
-    wire [2:0]  ts_idx  = ts_off >> 4;
-    wire [2:0]  ts_col  = (ts_off >> 1);
-    wire [10:0] ts_v    = y - GLYPH_Y;
-    wire [2:0]  ts_row  = ts_v >> 1;
-    wire in_ts_x = (x >= TS_X) && (x < TS_X + TS_LEN * CHAR_W);
-    wire in_ts_y = (y >= GLYPH_Y) && (y < GLYPH_Y + CHAR_H);
-    wire in_ts   = in_bar && in_ts_x && in_ts_y;
-
-    // ---- 底部信息栏区域 ----
-    wire in_bot_bar = (y >= BOT_Y);
-    wire [10:0] bot_off = x - BOT_X;
-    wire [4:0]  bot_idx = bot_off >> 4;
-    wire [2:0]  bot_col = (bot_off >> 1);
-    wire [10:0] bot_v   = y - BOT_GLYPH_Y;
-    wire [2:0]  bot_row = bot_v >> 1;
-    wire in_bot_x = (x >= BOT_X) && (x < BOT_X + BOT_LEN * CHAR_W);
-    wire in_bot_y = (y >= BOT_GLYPH_Y) && (y < BOT_GLYPH_Y + CHAR_H);
-    wire in_bot   = in_bot_bar && in_bot_x && in_bot_y;
-
-    // ---- 音频可视化（屏幕中心电平条）----
-    localparam [10:0] AV_X = 11'd160;
-    localparam [10:0] AV_Y = 11'd216;
-    localparam [10:0] AV_W = 11'd320;
-    localparam [10:0] AV_H = 11'd24;
-    wire [16:0] av_prod = {9'd0, i_audio_level} * 11'd320;
-    wire [9:0]  av_len  = av_prod[15:8];   // 电平条长度 0~320
-    wire in_av     = i_audio_viz && (x >= AV_X) && (x < AV_X + AV_W) && (y >= AV_Y) && (y < AV_Y + AV_H);
-    wire in_av_bar = in_av && (x < AV_X + {1'b0, av_len});
-
-    // ---- 音频频谱图（8 竖条，层3 K4 开关）----
-    // 布局：x 52~587（条宽 60、间隔 8），y 316~443（高 128），条高 = level×2
-    localparam [10:0] SPEC_X0 = 11'd52;
-    localparam [10:0] SPEC_Y0 = 11'd316;
-    localparam [10:0] SPEC_XW = 11'd536;
-    localparam [10:0] SPEC_YH = 11'd128;
-    wire [10:0] spec_sx = x - SPEC_X0;                      // 区域内列
-    wire [10:0] spec_dy = y - SPEC_Y0;
-    wire [10:0] spec_sy = (SPEC_YH - 11'd1) - spec_dy;      // 像素距底部高度
-    wire in_spec_area = i_spectrum_en && (x >= SPEC_X0) && (x < SPEC_X0 + SPEC_XW) &&
-                        (y >= SPEC_Y0) && (y < SPEC_Y0 + SPEC_YH);
-
-    reg [3:0] spec_band;    // 0~7 有效，8=间隙/无效
-    reg [6:0] spec_col;     // 步进 68 内的列
-    always @(*) begin
-        if      (spec_sx < 11'd68 ) begin spec_band = 4'd0; spec_col = spec_sx[6:0]; end
-        else if (spec_sx < 11'd136) begin spec_band = 4'd1; spec_col = spec_sx - 11'd68;  end
-        else if (spec_sx < 11'd204) begin spec_band = 4'd2; spec_col = spec_sx - 11'd136; end
-        else if (spec_sx < 11'd272) begin spec_band = 4'd3; spec_col = spec_sx - 11'd204; end
-        else if (spec_sx < 11'd340) begin spec_band = 4'd4; spec_col = spec_sx - 11'd272; end
-        else if (spec_sx < 11'd408) begin spec_band = 4'd5; spec_col = spec_sx - 11'd340; end
-        else if (spec_sx < 11'd476) begin spec_band = 4'd6; spec_col = spec_sx - 11'd408; end
-        else                          begin spec_band = 4'd7; spec_col = spec_sx - 11'd476; end
-    end
-
-    wire [5:0] spec_lvl = (spec_band == 4'd0) ? i_spec_level[5:0]   :
-                          (spec_band == 4'd1) ? i_spec_level[11:6]  :
-                          (spec_band == 4'd2) ? i_spec_level[17:12] :
-                          (spec_band == 4'd3) ? i_spec_level[23:18] :
-                          (spec_band == 4'd4) ? i_spec_level[29:24] :
-                          (spec_band == 4'd5) ? i_spec_level[35:30] :
-                          (spec_band == 4'd6) ? i_spec_level[41:36] :
-                                                i_spec_level[47:42];
-    wire [6:0] spec_bar_h = {spec_lvl, 1'b0};               // 条高 0~126
-    wire in_spec = in_spec_area && (spec_col < 7'd60) && (spec_sy < {1'b0, spec_bar_h});
-    wire [23:0] spec_color = (spec_sy >= 11'd112) ? 24'hFF0000 :  // 顶部红
-                             (spec_sy >= 11'd88)  ? 24'hFFFF00 :  // 中部黄
-                                                    24'h00FF00;   // 底部绿
-
     // ---- 标语锁存（跨域）+ 平滑滚动 ----
     reg [7:0] slogan [0:31];
     reg [5:0] slogan_len;
     wire [5:0] content_chars = (slogan_len > 6'd31) ? slogan_len : 6'd31;
     reg       slogan_dir;
     reg       scroll_en;
+    reg [9:0] scroll_pos;
     reg [2:0] upd_sync;
     wire      upd_edge = upd_sync[2] ^ upd_sync[1];
 
@@ -242,7 +152,6 @@ module osd_layer #(
             slogan_dir <= 1'b0;
             scroll_en  <= 1'b0;
             scroll_pos <= 10'd0;
-            // 默认标语 "EG4S20 HDMI PLAYER"
             slogan[0]  <= "E"; slogan[1]  <= "G"; slogan[2]  <= "4"; slogan[3]  <= "S";
             slogan[4]  <= "2"; slogan[5]  <= "0"; slogan[6]  <= " "; slogan[7]  <= "H";
             slogan[8]  <= "D"; slogan[9]  <= "M"; slogan[10] <= "I"; slogan[11] <= " ";
@@ -279,19 +188,42 @@ module osd_layer #(
         end
     end
 
-    // ---- 标语字符 ROM 索引（内容位置 mod 内容总宽）----
+    // ---- 顶部标语几何（ASCII 过滤，防中文/UTF-8 乱码）----
+    wire in_bar = (y < BAR_H);
+
+    wire [10:0] title_off   = x - TITLE_X;
+    wire [10:0] title_off_s = title_off + scroll_pos;
+    wire [6:0]  title_char_idx = title_off_s >> 4;
+    wire [2:0]  title_col   = title_off_s[4:2];
+    wire [10:0] title_v     = y - GLYPH_Y;
+    wire [2:0]  title_row   = title_v[3:1];
+    wire in_title_x = (x >= TITLE_X) && (x < TITLE_X + TITLE_LEN * CHAR_W);
+    wire in_title_y = (y >= GLYPH_Y) && (y < GLYPH_Y + CHAR_H);
+    wire in_title   = in_bar && in_title_x && in_title_y;
+
     wire [6:0] content_chars6 = {1'b0, content_chars};
-    wire [6:0] slogan_idx6 = (title_char_idx >= content_chars6) ? (title_char_idx - content_chars6) : title_char_idx;
+    wire [6:0] slogan_idx6 = (title_char_idx >= content_chars6) ?
+                             (title_char_idx - content_chars6) : title_char_idx;
     wire [5:0] slogan_idx = slogan_idx6[5:0];
+    wire [7:0] title_byte = slogan[slogan_idx];
+    wire title_ascii_ok = (slogan_idx < slogan_len) &&
+                          (title_byte >= 8'h20) && (title_byte <= 8'h7E);
     reg [6:0] title_char;
     always @(*) begin
-        if (slogan_idx < slogan_len)
-            title_char = slogan[slogan_idx];
-        else
-            title_char = 7'h20;
+        if (title_ascii_ok) title_char = title_byte[6:0];
+        else                title_char = 7'h20;
     end
 
-    // ---- 时间戳字符 ROM 索引：HH:MM:SS ----
+    // ---- 时间戳几何 ----
+    wire [10:0] ts_off = x - TS_X;
+    wire [2:0]  ts_idx = ts_off[6:4];
+    wire [2:0]  ts_col = ts_off[4:1];
+    wire [10:0] ts_v   = y - GLYPH_Y;
+    wire [2:0]  ts_row = ts_v[3:1];
+    wire in_ts_x = (x >= TS_X) && (x < TS_X + TS_LEN * CHAR_W);
+    wire in_ts_y = (y >= GLYPH_Y) && (y < GLYPH_Y + CHAR_H);
+    wire in_ts   = in_bar && in_ts_x && in_ts_y;
+
     reg [6:0] ts_char;
     always @(*) begin
         case (ts_idx)
@@ -307,45 +239,1015 @@ module osd_layer #(
         endcase
     end
 
-    // ---- 底部信息字符 ROM 索引：640x480 60FPS MOD:0 B:4 C:4 ----
+    // ---- 底部信息栏几何（保持不变）----
+    wire in_bot_bar = (y >= BOT_Y);
+    wire [10:0] bot_off = x - BOT_X;
+    wire [4:0]  bot_idx = bot_off[8:4];
+    wire [2:0]  bot_col = bot_off[3:1];
+    wire [10:0] bot_v   = y - BOT_GLYPH_Y;
+    wire [2:0]  bot_row = bot_v[3:1];
+    wire in_bot_x = (x >= BOT_X) && (x < BOT_X + BOT_LEN * CHAR_W);
+    wire in_bot_y = (y >= BOT_GLYPH_Y) && (y < BOT_GLYPH_Y + CHAR_H);
+    wire in_bot   = in_bot_bar && in_bot_x && in_bot_y;
+
     reg [6:0] bot_char;
     always @(*) begin
         case (bot_idx)
-            5'd0:  bot_char = 7'h36;                    // '6'
-            5'd1:  bot_char = 7'h34;                    // '4'
-            5'd2:  bot_char = 7'h30;                    // '0'
-            5'd3:  bot_char = 7'h78;                    // 'x'
-            5'd4:  bot_char = 7'h34;                    // '4'
-            5'd5:  bot_char = 7'h38;                    // '8'
-            5'd6:  bot_char = 7'h30;                    // '0'
-            5'd7:  bot_char = 7'h20;                    // (space)
-            5'd8:  bot_char = fps_tens_char;            // FPS 十位
-            5'd9:  bot_char = fps_ones_char;            // FPS 个位
-            5'd10: bot_char = 7'h46;                    // F
-            5'd11: bot_char = 7'h50;                    // P
-            5'd12: bot_char = 7'h53;                    // S
-            5'd13: bot_char = 7'h20;                    // (space)
-            5'd14: bot_char = 7'h4D;                    // M
-            5'd15: bot_char = 7'h4F;                    // O
-            5'd16: bot_char = 7'h44;                    // D
-            5'd17: bot_char = 7'h3A;                    // :
-            5'd18: bot_char = {3'h3, 2'b00, i_mode};    // '0'+模式
-            5'd19: bot_char = 7'h20;                    // (space)
-            5'd20: bot_char = 7'h42;                    // B
-            5'd21: bot_char = 7'h3A;                    // :
-            5'd22: bot_char = {3'h3, 1'b0, i_bright};   // '0'+亮度档
-            5'd23: bot_char = 7'h20;                    // (space)
-            5'd24: bot_char = 7'h43;                    // C
-            5'd25: bot_char = 7'h3A;                    // :
-            5'd26: bot_char = {3'h3, 1'b0, i_contrast}; // '0'+对比度档
+            5'd0:  bot_char = 7'h36;
+            5'd1:  bot_char = 7'h34;
+            5'd2:  bot_char = 7'h30;
+            5'd3:  bot_char = 7'h78;
+            5'd4:  bot_char = 7'h34;
+            5'd5:  bot_char = 7'h38;
+            5'd6:  bot_char = 7'h30;
+            5'd7:  bot_char = 7'h20;
+            5'd8:  bot_char = fps_tens_char;
+            5'd9:  bot_char = fps_ones_char;
+            5'd10: bot_char = 7'h46;
+            5'd11: bot_char = 7'h50;
+            5'd12: bot_char = 7'h53;
+            5'd13: bot_char = 7'h20;
+            5'd14: bot_char = 7'h4D;
+            5'd15: bot_char = 7'h4F;
+            5'd16: bot_char = 7'h44;
+            5'd17: bot_char = 7'h3A;
+            5'd18: bot_char = {3'h3, 2'b00, i_mode};
+            5'd19: bot_char = 7'h20;
+            5'd20: bot_char = 7'h42;
+            5'd21: bot_char = 7'h3A;
+            5'd22: bot_char = {3'h3, 1'b0, i_bright};
+            5'd23: bot_char = 7'h20;
+            5'd24: bot_char = 7'h43;
+            5'd25: bot_char = 7'h3A;
+            5'd26: bot_char = {3'h3, 1'b0, i_contrast};
             default: bot_char = 7'h20;
         endcase
     end
 
-    // ---- 字库 ROM（组合逻辑）----
+    // ======================= 启动界面 =======================
+    wire boot_mode = ~i_display_valid;
+
+    // 跑马灯相位（每帧步进）
+    reg [9:0] mq_phase;
+    always @(posedge i_clk or posedge i_rst) begin
+        if (i_rst) mq_phase <= 10'd0;
+        else if (vs_rise) mq_phase <= mq_phase + 10'd1;
+    end
+
+    // ---- 文字常量表 ----
+    // sid: 0=FPGA DISPLAY, 1=SYSTEM, 2=SWITCH FUNCTIONS, 3=CONTROLS,
+    //      4=STATUS, 5=EG4S20 HDMI PLAYER, 6=MODE/B/C 模板, 7=FOUND 模板
+    function [6:0] fixed_char;
+        input [2:0] sid;
+        input [4:0] idx;
+        begin
+            fixed_char = 7'h20;
+            case (sid)
+                3'd0: begin
+                    case (idx)
+                        5'd0:  fixed_char = "F";
+                        5'd1:  fixed_char = "P";
+                        5'd2:  fixed_char = "G";
+                        5'd3:  fixed_char = "A";
+                        5'd4:  fixed_char = " ";
+                        5'd5:  fixed_char = "D";
+                        5'd6:  fixed_char = "I";
+                        5'd7:  fixed_char = "S";
+                        5'd8:  fixed_char = "P";
+                        5'd9:  fixed_char = "L";
+                        5'd10: fixed_char = "A";
+                        5'd11: fixed_char = "Y";
+                        default: fixed_char = 7'h20;
+                    endcase
+                end
+                3'd1: begin
+                    case (idx)
+                        5'd0:  fixed_char = "S";
+                        5'd1:  fixed_char = "Y";
+                        5'd2:  fixed_char = "S";
+                        5'd3:  fixed_char = "T";
+                        5'd4:  fixed_char = "E";
+                        5'd5:  fixed_char = "M";
+                        default: fixed_char = 7'h20;
+                    endcase
+                end
+                3'd2: begin
+                    case (idx)
+                        5'd0:  fixed_char = "S";
+                        5'd1:  fixed_char = "W";
+                        5'd2:  fixed_char = "I";
+                        5'd3:  fixed_char = "T";
+                        5'd4:  fixed_char = "C";
+                        5'd5:  fixed_char = "H";
+                        5'd6:  fixed_char = " ";
+                        5'd7:  fixed_char = "F";
+                        5'd8:  fixed_char = "U";
+                        5'd9:  fixed_char = "N";
+                        5'd10: fixed_char = "C";
+                        5'd11: fixed_char = "T";
+                        5'd12: fixed_char = "I";
+                        5'd13: fixed_char = "O";
+                        5'd14: fixed_char = "N";
+                        5'd15: fixed_char = "S";
+                        default: fixed_char = 7'h20;
+                    endcase
+                end
+                3'd3: begin
+                    case (idx)
+                        5'd0: fixed_char = "C";
+                        5'd1: fixed_char = "O";
+                        5'd2: fixed_char = "N";
+                        5'd3: fixed_char = "T";
+                        5'd4: fixed_char = "R";
+                        5'd5: fixed_char = "O";
+                        5'd6: fixed_char = "L";
+                        5'd7: fixed_char = "S";
+                        default: fixed_char = 7'h20;
+                    endcase
+                end
+                3'd4: begin
+                    case (idx)
+                        5'd0: fixed_char = "S";
+                        5'd1: fixed_char = "T";
+                        5'd2: fixed_char = "A";
+                        5'd3: fixed_char = "T";
+                        5'd4: fixed_char = "U";
+                        5'd5: fixed_char = "S";
+                        default: fixed_char = 7'h20;
+                    endcase
+                end
+                3'd5: begin
+                    case (idx)
+                        5'd0:  fixed_char = "E";
+                        5'd1:  fixed_char = "G";
+                        5'd2:  fixed_char = "4";
+                        5'd3:  fixed_char = "S";
+                        5'd4:  fixed_char = "2";
+                        5'd5:  fixed_char = "0";
+                        5'd6:  fixed_char = " ";
+                        5'd7:  fixed_char = "H";
+                        5'd8:  fixed_char = "D";
+                        5'd9:  fixed_char = "M";
+                        5'd10: fixed_char = "I";
+                        5'd11: fixed_char = " ";
+                        5'd12: fixed_char = "P";
+                        5'd13: fixed_char = "L";
+                        5'd14: fixed_char = "A";
+                        5'd15: fixed_char = "Y";
+                        5'd16: fixed_char = "E";
+                        5'd17: fixed_char = "R";
+                        default: fixed_char = 7'h20;
+                    endcase
+                end
+                3'd6: begin
+                    case (idx)
+                        5'd0:  fixed_char = "M";
+                        5'd1:  fixed_char = "O";
+                        5'd2:  fixed_char = "D";
+                        5'd3:  fixed_char = "E";
+                        5'd4:  fixed_char = ":";
+                        5'd5:  fixed_char = " ";
+                        5'd6:  fixed_char = " ";
+                        5'd7:  fixed_char = "B";
+                        5'd8:  fixed_char = "R";
+                        5'd9:  fixed_char = "I";
+                        5'd10: fixed_char = "G";
+                        5'd11: fixed_char = "H";
+                        5'd12: fixed_char = "T";
+                        5'd13: fixed_char = ":";
+                        5'd14: fixed_char = " ";
+                        5'd15: fixed_char = " ";
+                        5'd16: fixed_char = "C";
+                        5'd17: fixed_char = "O";
+                        5'd18: fixed_char = "N";
+                        5'd19: fixed_char = "T";
+                        5'd20: fixed_char = "R";
+                        5'd21: fixed_char = "A";
+                        5'd22: fixed_char = "S";
+                        5'd23: fixed_char = "T";
+                        5'd24: fixed_char = ":";
+                        5'd25: fixed_char = " ";
+                        default: fixed_char = 7'h20;
+                    endcase
+                end
+                default: begin
+                    case (idx)
+                        5'd0:  fixed_char = "F";
+                        5'd1:  fixed_char = "O";
+                        5'd2:  fixed_char = "U";
+                        5'd3:  fixed_char = "N";
+                        5'd4:  fixed_char = "D";
+                        5'd5:  fixed_char = " ";
+                        5'd6:  fixed_char = "I";
+                        5'd7:  fixed_char = "M";
+                        5'd8:  fixed_char = "A";
+                        5'd9:  fixed_char = "G";
+                        5'd10: fixed_char = "E";
+                        5'd11: fixed_char = "S";
+                        5'd12: fixed_char = ":";
+                        5'd13: fixed_char = " ";
+                        default: fixed_char = 7'h20;
+                    endcase
+                end
+            endcase
+        end
+    endfunction
+
+    // 启动状态：0=SD CARD INIT... 1=SCANNING IMAGES... 2=LOADING IMAGE... 3=NO IMAGE ON SD
+    function [6:0] boot_msg_char;
+        input [1:0] sel;
+        input [4:0] idx;
+        begin
+            boot_msg_char = 7'h20;
+            case (sel)
+                2'd0: begin
+                    case (idx)
+                        5'd0:  boot_msg_char = "S";
+                        5'd1:  boot_msg_char = "D";
+                        5'd2:  boot_msg_char = " ";
+                        5'd3:  boot_msg_char = "C";
+                        5'd4:  boot_msg_char = "A";
+                        5'd5:  boot_msg_char = "R";
+                        5'd6:  boot_msg_char = "D";
+                        5'd7:  boot_msg_char = " ";
+                        5'd8:  boot_msg_char = "I";
+                        5'd9:  boot_msg_char = "N";
+                        5'd10: boot_msg_char = "I";
+                        5'd11: boot_msg_char = "T";
+                        5'd12: boot_msg_char = ".";
+                        5'd13: boot_msg_char = ".";
+                        5'd14: boot_msg_char = ".";
+                        default: boot_msg_char = 7'h20;
+                    endcase
+                end
+                2'd1: begin
+                    case (idx)
+                        5'd0:  boot_msg_char = "S";
+                        5'd1:  boot_msg_char = "C";
+                        5'd2:  boot_msg_char = "A";
+                        5'd3:  boot_msg_char = "N";
+                        5'd4:  boot_msg_char = "N";
+                        5'd5:  boot_msg_char = "I";
+                        5'd6:  boot_msg_char = "N";
+                        5'd7:  boot_msg_char = "G";
+                        5'd8:  boot_msg_char = " ";
+                        5'd9:  boot_msg_char = "I";
+                        5'd10: boot_msg_char = "M";
+                        5'd11: boot_msg_char = "A";
+                        5'd12: boot_msg_char = "G";
+                        5'd13: boot_msg_char = "E";
+                        5'd14: boot_msg_char = "S";
+                        5'd15: boot_msg_char = ".";
+                        5'd16: boot_msg_char = ".";
+                        5'd17: boot_msg_char = ".";
+                        default: boot_msg_char = 7'h20;
+                    endcase
+                end
+                2'd2: begin
+                    case (idx)
+                        5'd0:  boot_msg_char = "L";
+                        5'd1:  boot_msg_char = "O";
+                        5'd2:  boot_msg_char = "A";
+                        5'd3:  boot_msg_char = "D";
+                        5'd4:  boot_msg_char = "I";
+                        5'd5:  boot_msg_char = "N";
+                        5'd6:  boot_msg_char = "G";
+                        5'd7:  boot_msg_char = " ";
+                        5'd8:  boot_msg_char = "I";
+                        5'd9:  boot_msg_char = "M";
+                        5'd10: boot_msg_char = "A";
+                        5'd11: boot_msg_char = "G";
+                        5'd12: boot_msg_char = "E";
+                        5'd13: boot_msg_char = ".";
+                        5'd14: boot_msg_char = ".";
+                        5'd15: boot_msg_char = ".";
+                        default: boot_msg_char = 7'h20;
+                    endcase
+                end
+                default: begin
+                    case (idx)
+                        5'd0:  boot_msg_char = "N";
+                        5'd1:  boot_msg_char = "O";
+                        5'd2:  boot_msg_char = " ";
+                        5'd3:  boot_msg_char = "I";
+                        5'd4:  boot_msg_char = "M";
+                        5'd5:  boot_msg_char = "A";
+                        5'd6:  boot_msg_char = "G";
+                        5'd7:  boot_msg_char = "E";
+                        5'd8:  boot_msg_char = " ";
+                        5'd9:  boot_msg_char = "O";
+                        5'd10: boot_msg_char = "N";
+                        5'd11: boot_msg_char = " ";
+                        5'd12: boot_msg_char = "S";
+                        5'd13: boot_msg_char = "D";
+                        default: boot_msg_char = 7'h20;
+                    endcase
+                end
+            endcase
+        end
+    endfunction
+
+    // 右面板按键说明（9 行 × 最多 23 字符）
+    function [6:0] guide_char;
+        input [3:0] line;
+        input [4:0] col;
+        begin
+            guide_char = 7'h20;
+            case (line)
+                4'd0: begin   // SW1 IMAGE LAYER
+                    case (col)
+                        5'd0: guide_char = "S";
+                        5'd1: guide_char = "W";
+                        5'd2: guide_char = "1";
+                        5'd3: guide_char = " ";
+                        5'd4: guide_char = "I";
+                        5'd5: guide_char = "M";
+                        5'd6: guide_char = "A";
+                        5'd7: guide_char = "G";
+                        5'd8: guide_char = "E";
+                        5'd9: guide_char = " ";
+                        5'd10: guide_char = "L";
+                        5'd11: guide_char = "A";
+                        5'd12: guide_char = "Y";
+                        5'd13: guide_char = "E";
+                        5'd14: guide_char = "R";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+                4'd1: begin   //  K1 MODE  K2 NEXT
+                    case (col)
+                        5'd0:  guide_char = " ";
+                        5'd1:  guide_char = "K";
+                        5'd2:  guide_char = "1";
+                        5'd3:  guide_char = " ";
+                        5'd4:  guide_char = "M";
+                        5'd5:  guide_char = "O";
+                        5'd6:  guide_char = "D";
+                        5'd7:  guide_char = "E";
+                        5'd8:  guide_char = " ";
+                        5'd9:  guide_char = " ";
+                        5'd10: guide_char = "K";
+                        5'd11: guide_char = "2";
+                        5'd12: guide_char = " ";
+                        5'd13: guide_char = "N";
+                        5'd14: guide_char = "E";
+                        5'd15: guide_char = "X";
+                        5'd16: guide_char = "T";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+                4'd2: begin   //  K3 CONTRAST  K4 BRIGHT
+                    case (col)
+                        5'd0:  guide_char = " ";
+                        5'd1:  guide_char = "K";
+                        5'd2:  guide_char = "3";
+                        5'd3:  guide_char = " ";
+                        5'd4:  guide_char = "C";
+                        5'd5:  guide_char = "O";
+                        5'd6:  guide_char = "N";
+                        5'd7:  guide_char = "T";
+                        5'd8:  guide_char = "R";
+                        5'd9:  guide_char = "A";
+                        5'd10: guide_char = "S";
+                        5'd11: guide_char = "T";
+                        5'd12: guide_char = " ";
+                        5'd13: guide_char = " ";
+                        5'd14: guide_char = "K";
+                        5'd15: guide_char = "4";
+                        5'd16: guide_char = " ";
+                        5'd17: guide_char = "B";
+                        5'd18: guide_char = "R";
+                        5'd19: guide_char = "I";
+                        5'd20: guide_char = "G";
+                        5'd21: guide_char = "H";
+                        5'd22: guide_char = "T";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+                4'd3: begin   // SW2 AUTO LAYER
+                    case (col)
+                        5'd0:  guide_char = "S";
+                        5'd1:  guide_char = "W";
+                        5'd2:  guide_char = "2";
+                        5'd3:  guide_char = " ";
+                        5'd4:  guide_char = "A";
+                        5'd5:  guide_char = "U";
+                        5'd6:  guide_char = "T";
+                        5'd7:  guide_char = "O";
+                        5'd8:  guide_char = " ";
+                        5'd9:  guide_char = "L";
+                        5'd10: guide_char = "A";
+                        5'd11: guide_char = "Y";
+                        5'd12: guide_char = "E";
+                        5'd13: guide_char = "R";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+                4'd4: begin   //  K1 MODE  K3 AUTOPLAY
+                    case (col)
+                        5'd0:  guide_char = " ";
+                        5'd1:  guide_char = "K";
+                        5'd2:  guide_char = "1";
+                        5'd3:  guide_char = " ";
+                        5'd4:  guide_char = "M";
+                        5'd5:  guide_char = "O";
+                        5'd6:  guide_char = "D";
+                        5'd7:  guide_char = "E";
+                        5'd8:  guide_char = " ";
+                        5'd9:  guide_char = " ";
+                        5'd10: guide_char = "K";
+                        5'd11: guide_char = "3";
+                        5'd12: guide_char = " ";
+                        5'd13: guide_char = "A";
+                        5'd14: guide_char = "U";
+                        5'd15: guide_char = "T";
+                        5'd16: guide_char = "O";
+                        5'd17: guide_char = "P";
+                        5'd18: guide_char = "L";
+                        5'd19: guide_char = "A";
+                        5'd20: guide_char = "Y";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+                4'd5: begin   // SW3 AUDIO LAYER
+                    case (col)
+                        5'd0:  guide_char = "S";
+                        5'd1:  guide_char = "W";
+                        5'd2:  guide_char = "3";
+                        5'd3:  guide_char = " ";
+                        5'd4:  guide_char = "A";
+                        5'd5:  guide_char = "U";
+                        5'd6:  guide_char = "D";
+                        5'd7:  guide_char = "I";
+                        5'd8:  guide_char = "O";
+                        5'd9:  guide_char = " ";
+                        5'd10: guide_char = "L";
+                        5'd11: guide_char = "A";
+                        5'd12: guide_char = "Y";
+                        5'd13: guide_char = "E";
+                        5'd14: guide_char = "R";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+                4'd6: begin   //  K1 AUDIO  K3 VU METER
+                    case (col)
+                        5'd0:  guide_char = " ";
+                        5'd1:  guide_char = "K";
+                        5'd2:  guide_char = "1";
+                        5'd3:  guide_char = " ";
+                        5'd4:  guide_char = "A";
+                        5'd5:  guide_char = "U";
+                        5'd6:  guide_char = "D";
+                        5'd7:  guide_char = "I";
+                        5'd8:  guide_char = "O";
+                        5'd9:  guide_char = " ";
+                        5'd10: guide_char = " ";
+                        5'd11: guide_char = "K";
+                        5'd12: guide_char = "3";
+                        5'd13: guide_char = " ";
+                        5'd14: guide_char = "V";
+                        5'd15: guide_char = "U";
+                        5'd16: guide_char = " ";
+                        5'd17: guide_char = "M";
+                        5'd18: guide_char = "E";
+                        5'd19: guide_char = "T";
+                        5'd20: guide_char = "E";
+                        5'd21: guide_char = "R";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+                4'd7: begin   //  K4 SPECTRUM  SW4:RSVD
+                    case (col)
+                        5'd0:  guide_char = " ";
+                        5'd1:  guide_char = "K";
+                        5'd2:  guide_char = "4";
+                        5'd3:  guide_char = " ";
+                        5'd4:  guide_char = "S";
+                        5'd5:  guide_char = "P";
+                        5'd6:  guide_char = "E";
+                        5'd7:  guide_char = "C";
+                        5'd8:  guide_char = "T";
+                        5'd9:  guide_char = "R";
+                        5'd10: guide_char = "U";
+                        5'd11: guide_char = "M";
+                        5'd12: guide_char = " ";
+                        5'd13: guide_char = " ";
+                        5'd14: guide_char = "S";
+                        5'd15: guide_char = "W";
+                        5'd16: guide_char = "4";
+                        5'd17: guide_char = ":";
+                        5'd18: guide_char = "R";
+                        5'd19: guide_char = "S";
+                        5'd20: guide_char = "V";
+                        5'd21: guide_char = "D";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+                default: begin // K2 NEXT IMAGE ANY LAYER
+                    case (col)
+                        5'd0:  guide_char = "K";
+                        5'd1:  guide_char = "2";
+                        5'd2:  guide_char = " ";
+                        5'd3:  guide_char = "N";
+                        5'd4:  guide_char = "E";
+                        5'd5:  guide_char = "X";
+                        5'd6:  guide_char = "T";
+                        5'd7:  guide_char = " ";
+                        5'd8:  guide_char = "I";
+                        5'd9:  guide_char = "M";
+                        5'd10: guide_char = "A";
+                        5'd11: guide_char = "G";
+                        5'd12: guide_char = "E";
+                        5'd13: guide_char = " ";
+                        5'd14: guide_char = "A";
+                        5'd15: guide_char = "N";
+                        5'd16: guide_char = "Y";
+                        5'd17: guide_char = " ";
+                        5'd18: guide_char = "L";
+                        5'd19: guide_char = "A";
+                        5'd20: guide_char = "Y";
+                        5'd21: guide_char = "E";
+                        5'd22: guide_char = "R";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+            endcase
+        end
+    endfunction
+
+    // 右面板实时状态（3 行 × 16 字符）
+    function [6:0] stat_char;
+        input [1:0] line;
+        input [4:0] col;
+        begin
+            stat_char = 7'h20;
+            case (line)
+                2'd0: begin   // MODE:0  B:4  C:4
+                    case (col)
+                        5'd0:  stat_char = "M";
+                        5'd1:  stat_char = "O";
+                        5'd2:  stat_char = "D";
+                        5'd3:  stat_char = "E";
+                        5'd4:  stat_char = ":";
+                        5'd5:  stat_char = {3'h3, 2'b00, i_mode};
+                        5'd6:  stat_char = " ";
+                        5'd7:  stat_char = " ";
+                        5'd8:  stat_char = "B";
+                        5'd9:  stat_char = ":";
+                        5'd10: stat_char = {3'h3, 1'b0, i_bright};
+                        5'd11: stat_char = " ";
+                        5'd12: stat_char = " ";
+                        5'd13: stat_char = "C";
+                        5'd14: stat_char = ":";
+                        5'd15: stat_char = {3'h3, 1'b0, i_contrast};
+                        default: stat_char = 7'h20;
+                    endcase
+                end
+                2'd1: begin   // AUTO:OFF  VU:OFF
+                    case (col)
+                        5'd0:  stat_char = "A";
+                        5'd1:  stat_char = "U";
+                        5'd2:  stat_char = "T";
+                        5'd3:  stat_char = "O";
+                        5'd4:  stat_char = ":";
+                        5'd5:  stat_char = "O";
+                        5'd6:  stat_char = i_auto_play ? "N" : "F";
+                        5'd7:  stat_char = i_auto_play ? " " : "F";
+                        5'd8:  stat_char = " ";
+                        5'd9:  stat_char = " ";
+                        5'd10: stat_char = "V";
+                        5'd11: stat_char = "U";
+                        5'd12: stat_char = ":";
+                        5'd13: stat_char = "O";
+                        5'd14: stat_char = i_audio_viz ? "N" : "F";
+                        5'd15: stat_char = i_audio_viz ? " " : "F";
+                        default: stat_char = 7'h20;
+                    endcase
+                end
+                default: begin // SPEC:OFF  IMG:0
+                    case (col)
+                        5'd0:  stat_char = "S";
+                        5'd1:  stat_char = "P";
+                        5'd2:  stat_char = "E";
+                        5'd3:  stat_char = "C";
+                        5'd4:  stat_char = ":";
+                        5'd5:  stat_char = "O";
+                        5'd6:  stat_char = i_spectrum_en ? "N" : "F";
+                        5'd7:  stat_char = i_spectrum_en ? " " : "F";
+                        5'd8:  stat_char = " ";
+                        5'd9:  stat_char = " ";
+                        5'd10: stat_char = "I";
+                        5'd11: stat_char = "M";
+                        5'd12: stat_char = "G";
+                        5'd13: stat_char = ":";
+                        5'd14: stat_char = {3'h3, 1'b0, i_img_count};
+                        5'd15: stat_char = " ";
+                        default: stat_char = 7'h20;
+                    endcase
+                end
+            endcase
+        end
+    endfunction
+
+    // 32 段频谱电平读取
+    function [5:0] spec_get;
+        input [191:0] v;
+        input [4:0] b;
+        begin
+            case (b)
+                5'd0:  spec_get = v[5:0];
+                5'd1:  spec_get = v[11:6];
+                5'd2:  spec_get = v[17:12];
+                5'd3:  spec_get = v[23:18];
+                5'd4:  spec_get = v[29:24];
+                5'd5:  spec_get = v[35:30];
+                5'd6:  spec_get = v[41:36];
+                5'd7:  spec_get = v[47:42];
+                5'd8:  spec_get = v[53:48];
+                5'd9:  spec_get = v[59:54];
+                5'd10: spec_get = v[65:60];
+                5'd11: spec_get = v[71:66];
+                5'd12: spec_get = v[77:72];
+                5'd13: spec_get = v[83:78];
+                5'd14: spec_get = v[89:84];
+                5'd15: spec_get = v[95:90];
+                5'd16: spec_get = v[101:96];
+                5'd17: spec_get = v[107:102];
+                5'd18: spec_get = v[113:108];
+                5'd19: spec_get = v[119:114];
+                5'd20: spec_get = v[125:120];
+                5'd21: spec_get = v[131:126];
+                5'd22: spec_get = v[137:132];
+                5'd23: spec_get = v[143:138];
+                5'd24: spec_get = v[149:144];
+                5'd25: spec_get = v[155:150];
+                5'd26: spec_get = v[161:156];
+                5'd27: spec_get = v[167:162];
+                5'd28: spec_get = v[173:168];
+                5'd29: spec_get = v[179:174];
+                5'd30: spec_get = v[185:180];
+                5'd31: spec_get = v[191:186];
+                default: spec_get = 6'd0;
+            endcase
+        end
+    endfunction
+
+    wire [1:0] boot_sel = (!i_sd_init_done)     ? 2'd0 :
+                          (!i_scan_done)        ? 2'd1 :
+                          (i_img_count == 3'd0) ? 2'd3 :
+                                                  2'd2;
+
+    // ---- 左面板：x8..408, y80..392，3px 跑马灯边框 ----
+    localparam [10:0] LP_X0 = 11'd8;
+    localparam [10:0] LP_X1 = 11'd408;
+    localparam [10:0] LP_Y0 = 11'd80;
+    localparam [10:0] LP_Y1 = 11'd392;
+
+    wire in_lp = boot_mode && (x >= LP_X0) && (x < LP_X1) &&
+                 (y >= LP_Y0) && (y < LP_Y1);
+    wire in_lp_border = in_lp && ((x < LP_X0 + 11'd3) || (x >= LP_X1 - 11'd3) ||
+                                  (y < LP_Y0 + 11'd3) || (y >= LP_Y1 - 11'd3));
+
+    wire [10:0] mq_sum = x + y + {1'b0, mq_phase};
+    wire mq_lit = (mq_sum[3:0] < 4'd8);
+    reg [23:0] mq_color;
+    always @(*) begin
+        case (mq_sum[6:5])
+            2'd0: mq_color = 24'h00E5FF;
+            2'd1: mq_color = 24'h33FF99;
+            2'd2: mq_color = 24'hFFD166;
+            default: mq_color = 24'hFF5CA8;
+        endcase
+    end
+
+    // 标题："FPGA DISPLAY" / "SYSTEM"（4x）
+    localparam [10:0] T1_X = 11'd16;
+    localparam [10:0] T1_Y = 11'd120;
+    wire [10:0] t1_off = x - T1_X;
+    wire [3:0]  t1_idx = t1_off[8:5];
+    wire [2:0]  t1_col = t1_off[4:2];
+    wire [10:0] t1_v   = y - T1_Y;
+    wire [2:0]  t1_row = t1_v[4:2];
+    wire in_t1 = boot_mode && (x >= T1_X) && (x < T1_X + 11'd384) &&
+                 (y >= T1_Y) && (y < T1_Y + 11'd32);
+
+    localparam [10:0] T2_X = 11'd112;
+    localparam [10:0] T2_Y = 11'd160;
+    wire [10:0] t2_off = x - T2_X;
+    wire [2:0]  t2_idx = t2_off[7:5];
+    wire [2:0]  t2_col = t2_off[4:2];
+    wire [10:0] t2_v   = y - T2_Y;
+    wire [2:0]  t2_row = t2_v[4:2];
+    wire in_t2 = boot_mode && (x >= T2_X) && (x < T2_X + 11'd192) &&
+                 (y >= T2_Y) && (y < T2_Y + 11'd32);
+
+    // 启动状态文字（2x）
+    localparam [10:0] BST_X = 11'd64;
+    localparam [10:0] BST_Y = 11'd224;
+    wire [10:0] bst_off = x - BST_X;
+    wire [4:0]  bst_idx = bst_off[8:4];
+    wire [2:0]  bst_col = bst_off[3:1];
+    wire [10:0] bst_v   = y - BST_Y;
+    wire [2:0]  bst_row = bst_v[3:1];
+    wire in_bst = boot_mode && (x >= BST_X) && (x < BST_X + 11'd288) &&
+                  (y >= BST_Y) && (y < BST_Y + 11'd16);
+
+    // "FOUND IMAGES: n"（2x）
+    localparam [10:0] FND_X = 11'd88;
+    localparam [10:0] FND_Y = 11'd256;
+    wire [10:0] fnd_off = x - FND_X;
+    wire [4:0]  fnd_idx = fnd_off[8:4];
+    wire [2:0]  fnd_col = fnd_off[3:1];
+    wire [10:0] fnd_v   = y - FND_Y;
+    wire [2:0]  fnd_row = fnd_v[3:1];
+    wire in_fnd = boot_mode && (x >= FND_X) && (x < FND_X + 11'd240) &&
+                  (y >= FND_Y) && (y < FND_Y + 11'd16);
+
+    // "MODE:0 BRIGHT:4 CONTRAST:4"（1x）
+    localparam [10:0] CFG_X = 11'd104;
+    localparam [10:0] CFG_Y = 11'd292;
+    wire [10:0] cfg_off = x - CFG_X;
+    wire [4:0]  cfg_idx = cfg_off[7:3];
+    wire [2:0]  cfg_col = cfg_off[2:0];
+    wire [10:0] cfg_v   = y - CFG_Y;
+    wire [2:0]  cfg_row = cfg_v[2:0];
+    wire in_cfg = boot_mode && (x >= CFG_X) && (x < CFG_X + 11'd208) &&
+                  (y >= CFG_Y) && (y < CFG_Y + 11'd8);
+
+    // 进度条
+    wire in_prg = (x >= 11'd80) && (x < 11'd336) && (y >= 11'd320) && (y < 11'd328);
+    wire [10:0] prg_raw = x - 11'd80;
+    wire [10:0] prg_pos = prg_raw + {1'b0, mq_phase};
+    wire prg_lit  = (prg_pos[7:0] < 8'd48);
+    wire prg_edge = (x == 11'd80) || (x == 11'd335) ||
+                    (y == 11'd320) || (y == 11'd327);
+
+    wire in_div1 = (y >= 11'd204) && (y < 11'd206) &&
+                   (x >= 11'd56) && (x < 11'd360);
+
+    // 底部署名（1x）
+    localparam [10:0] FTR_X = 11'd136;
+    localparam [10:0] FTR_Y = 11'd348;
+    wire [10:0] ftr_off = x - FTR_X;
+    wire [4:0]  ftr_idx = ftr_off[7:3];
+    wire [2:0]  ftr_col = ftr_off[2:0];
+    wire [10:0] ftr_v   = y - FTR_Y;
+    wire [2:0]  ftr_row = ftr_v[2:0];
+    wire in_ftr = boot_mode && (x >= FTR_X) && (x < FTR_X + 11'd144) &&
+                  (y >= FTR_Y) && (y < FTR_Y + 11'd8);
+
+    // ---- 右面板：x416..624, y80..392，2px 边框 ----
+    localparam [10:0] RP_X0 = 11'd416;
+    localparam [10:0] RP_X1 = 11'd624;
+    localparam [10:0] RP_Y0 = 11'd80;
+    localparam [10:0] RP_Y1 = 11'd392;
+
+    wire in_rp = boot_mode && (x >= RP_X0) && (x < RP_X1) &&
+                 (y >= RP_Y0) && (y < RP_Y1);
+    wire in_rp_border = in_rp && ((x < RP_X0 + 11'd2) || (x >= RP_X1 - 11'd2) ||
+                                  (y < RP_Y0 + 11'd2) || (y >= RP_Y1 - 11'd2));
+
+    // "CONTROLS"（2x）
+    localparam [10:0] RH_X = 11'd456;
+    localparam [10:0] RH_Y = 11'd90;
+    wire [10:0] rh_off = x - RH_X;
+    wire [2:0]  rh_idx = rh_off[6:4];
+    wire [2:0]  rh_col = rh_off[4:1];
+    wire [10:0] rh_v   = y - RH_Y;
+    wire [2:0]  rh_row = rh_v[4:1];
+    wire in_rh = boot_mode && (x >= RH_X) && (x < RH_X + 11'd128) &&
+                 (y >= RH_Y) && (y < RH_Y + 11'd16);
+
+    // "SWITCH FUNCTIONS"（1x）
+    localparam [10:0] RS_X = 11'd456;
+    localparam [10:0] RS_Y = 11'd112;
+    wire [10:0] rs_off = x - RS_X;
+    wire [3:0]  rs_idx = rs_off[6:3];
+    wire [2:0]  rs_col = rs_off[2:0];
+    wire [10:0] rs_v   = y - RS_Y;
+    wire [2:0]  rs_row = rs_v[2:0];
+    wire in_rs = boot_mode && (x >= RS_X) && (x < RS_X + 11'd128) &&
+                 (y >= RS_Y) && (y < RS_Y + 11'd8);
+
+    wire in_rhdiv = (y >= 11'd124) && (y < 11'd126) &&
+                    (x >= 11'd418) && (x < 11'd622);
+
+    // 按键说明（1x，9 行，16px 行距，仅每行前 8px 出字）
+    localparam [10:0] GD_X = 11'd432;
+    localparam [10:0] GD_Y = 11'd134;
+    wire [10:0] gd_offx = x - GD_X;
+    wire [10:0] gd_offy = y - GD_Y;
+    wire [4:0]  gd_col  = gd_offx[7:3];
+    wire [3:0]  gd_line = gd_offy[7:4];
+    wire [2:0]  gd_row  = gd_offy[2:0];
+    wire in_gd = boot_mode && (x >= GD_X) && (x < GD_X + 11'd184) &&
+                 (y >= GD_Y) && (y < GD_Y + 11'd144) && ~gd_offy[3];
+
+    wire in_div2 = (y >= 11'd280) && (y < 11'd282) &&
+                   (x >= 11'd418) && (x < 11'd622);
+
+    // "STATUS"（2x）
+    localparam [10:0] STH_X = 11'd472;
+    localparam [10:0] STH_Y = 11'd290;
+    wire [10:0] sth_off = x - STH_X;
+    wire [2:0]  sth_idx = sth_off[6:4];
+    wire [2:0]  sth_col = sth_off[4:1];
+    wire [10:0] sth_v   = y - STH_Y;
+    wire [2:0]  sth_row = sth_v[4:1];
+    wire in_sth = boot_mode && (x >= STH_X) && (x < STH_X + 11'd96) &&
+                  (y >= STH_Y) && (y < STH_Y + 11'd16);
+
+    // 实时状态（1x，3 行）
+    localparam [10:0] ST_X = 11'd456;
+    localparam [10:0] ST_Y = 11'd314;
+    wire [10:0] st_offx = x - ST_X;
+    wire [10:0] st_offy = y - ST_Y;
+    wire [3:0]  st_col  = st_offx[6:3];
+    wire [1:0]  st_line = st_offy[5:4];
+    wire [2:0]  st_row  = st_offy[2:0];
+    wire in_st = boot_mode && (x >= ST_X) && (x < ST_X + 11'd128) &&
+                 (y >= ST_Y) && (y < ST_Y + 11'd48) && ~st_offy[3];
+
+    // ---- 启动界面字符选择（共享一套字库）----
+    reg [6:0]  boot_char;
+    reg [2:0]  boot_row;
+    reg [2:0]  boot_col;
+    reg        boot_text_on;
+    reg [23:0] boot_text_color;
+
+    always @(*) begin
+        boot_char       = 7'h20;
+        boot_row        = 3'd0;
+        boot_col        = 3'd0;
+        boot_text_on    = 1'b0;
+        boot_text_color = 24'hFFFFFF;
+
+        if (in_t1) begin
+            boot_char = fixed_char(3'd0, {1'b0, t1_idx});
+            boot_row  = t1_row;
+            boot_col  = t1_col;
+            boot_text_on = 1'b1;
+            boot_text_color = 24'h9BE8FF;
+        end else if (in_t2) begin
+            boot_char = fixed_char(3'd1, {2'b00, t2_idx});
+            boot_row  = t2_row;
+            boot_col  = t2_col;
+            boot_text_on = 1'b1;
+            boot_text_color = 24'h9BE8FF;
+        end else if (in_bst) begin
+            boot_char = boot_msg_char(boot_sel, bst_idx);
+            boot_row  = bst_row;
+            boot_col  = bst_col;
+            boot_text_on = 1'b1;
+            boot_text_color = 24'hFFFFFF;
+        end else if (in_fnd) begin
+            if (fnd_idx == 5'd14)
+                boot_char = {3'h3, 2'b00, i_img_count};
+            else
+                boot_char = fixed_char(3'd7, fnd_idx);
+            boot_row  = fnd_row;
+            boot_col  = fnd_col;
+            boot_text_on = 1'b1;
+            boot_text_color = 24'h8CFFB0;
+        end else if (in_cfg) begin
+            case (cfg_idx)
+                5'd5:  boot_char = {3'h3, 2'b00, i_mode};
+                5'd14: boot_char = {3'h3, 1'b0, i_bright};
+                5'd25: boot_char = {3'h3, 1'b0, i_contrast};
+                default: boot_char = fixed_char(3'd6, cfg_idx);
+            endcase
+            boot_row  = cfg_row;
+            boot_col  = cfg_col;
+            boot_text_on = 1'b1;
+            boot_text_color = 24'h9AA8C0;
+        end else if (in_ftr) begin
+            boot_char = fixed_char(3'd5, ftr_idx);
+            boot_row  = ftr_row;
+            boot_col  = ftr_col;
+            boot_text_on = 1'b1;
+            boot_text_color = 24'h5F7290;
+        end else if (in_rh) begin
+            boot_char = fixed_char(3'd3, {1'b0, rh_idx});
+            boot_row  = rh_row;
+            boot_col  = rh_col;
+            boot_text_on = 1'b1;
+            boot_text_color = 24'h9BE8FF;
+        end else if (in_rs) begin
+            boot_char = fixed_char(3'd2, rs_idx);
+            boot_row  = rs_row;
+            boot_col  = rs_col;
+            boot_text_on = 1'b1;
+            boot_text_color = 24'h6FD3FF;
+        end else if (in_gd) begin
+            boot_char = guide_char(gd_line, gd_col);
+            boot_row  = gd_row;
+            boot_col  = gd_col[2:0];
+            boot_text_on = 1'b1;
+            boot_text_color = 24'hB8C6DC;
+        end else if (in_sth) begin
+            boot_char = fixed_char(3'd4, {1'b0, sth_idx});
+            boot_row  = sth_row;
+            boot_col  = sth_col;
+            boot_text_on = 1'b1;
+            boot_text_color = 24'h7CFFB2;
+        end else if (in_st) begin
+            boot_char = stat_char(st_line, st_col);
+            boot_row  = st_row;
+            boot_col  = st_col[2:0];
+            boot_text_on = 1'b1;
+            boot_text_color = 24'hA8B8D0;
+        end
+    end
+
+    // ---- 32 段频谱平滑 + 峰值保持 ----
+    reg [5:0] bar_lvl [0:31];
+    reg [5:0] bar_pk  [0:31];
+    reg [5:0] pk_hold [0:31];
+    integer   bi;
+    reg [5:0] nl;
+
+    always @(posedge i_clk or posedge i_rst) begin
+        if (i_rst) begin
+            for (bi = 0; bi < 32; bi = bi + 1) begin
+                bar_lvl[bi] <= 6'd0;
+                bar_pk[bi]  <= 6'd0;
+                pk_hold[bi] <= 6'd0;
+            end
+        end else if (vs_rise) begin
+            for (bi = 0; bi < 32; bi = bi + 1) begin
+                nl = spec_get(i_spec_level, bi[4:0]);
+                if (nl > bar_lvl[bi])
+                    bar_lvl[bi] <= nl;
+                else if (bar_lvl[bi] > 6'd0)
+                    bar_lvl[bi] <= bar_lvl[bi] - 6'd1;
+
+                if (nl >= bar_pk[bi]) begin
+                    bar_pk[bi]  <= nl;
+                    pk_hold[bi] <= 6'd24;
+                end else if (pk_hold[bi] > 6'd0) begin
+                    pk_hold[bi] <= pk_hold[bi] - 6'd1;
+                end else if (bar_pk[bi] > 6'd0) begin
+                    bar_pk[bi] <= bar_pk[bi] - 6'd1;
+                end
+            end
+        end
+    end
+
+    // ---- 频谱绘制：面板 x56..584, y316..456，柱区 512px ----
+    localparam [10:0] SP_X0 = 11'd56;
+    localparam [10:0] SP_X1 = 11'd584;
+    localparam [10:0] SP_Y0 = 11'd316;
+    localparam [10:0] SP_Y1 = 11'd456;
+
+    wire spec_en = ~boot_mode && i_spectrum_en;
+    wire in_spec_panel = spec_en && (x >= SP_X0) && (x < SP_X1) &&
+                         (y >= SP_Y0) && (y < SP_Y1);
+    wire spec_border = in_spec_panel &&
+                       ((x == SP_X0) || (x == SP_X1 - 11'd1) ||
+                        (y == SP_Y0) || (y == SP_Y1 - 11'd1));
+
+    wire [10:0] bar_sx = x - 11'd64;
+    wire [4:0]  spec_band = bar_sx[8:4];
+    wire [3:0]  spec_col  = bar_sx[3:0];
+    wire [10:0] spec_sy11 = 11'd451 - y;
+    wire [7:0]  spec_sy   = spec_sy11[7:0];
+    wire spec_in_bars = (x >= 11'd64) && (x < 11'd576) &&
+                        (y >= 11'd324) && (y < 11'd452);
+
+    wire [5:0] cur_lvl = bar_lvl[spec_band];
+    wire [5:0] cur_pk  = bar_pk[spec_band];
+    wire [7:0] cur_h   = {1'b0, cur_lvl, 1'b0};
+    wire [7:0] pk_h    = {1'b0, cur_pk, 1'b0};
+    wire bar_pix  = spec_in_bars && (spec_col < 4'd14) && (spec_sy < cur_h);
+    wire peak_pix = spec_in_bars && (spec_col < 4'd14) && (cur_pk != 6'd0) &&
+                    ((spec_sy + 8'd1 == pk_h) || (spec_sy + 8'd2 == pk_h));
+
+    wire [23:0] spec_color = (spec_sy >= 8'd96) ? 24'hFF3860 :
+                             (spec_sy >= 8'd64) ? 24'hFFC93C :
+                             (spec_sy >= 8'd32) ? 24'h5CFF7A :
+                                                  24'h28C8FF;
+    wire [23:0] spec_bg = ((x[4:0] == 5'd0) || (y[3:0] == 4'd0)) ?
+                          24'h101A2C : 24'h080A12;
+
+    // ---- VU 电平条（保持原位置）----
+    localparam [10:0] AV_X = 11'd160;
+    localparam [10:0] AV_Y = 11'd216;
+    localparam [10:0] AV_W = 11'd320;
+    localparam [10:0] AV_H = 11'd24;
+    wire [16:0] av_prod = {9'd0, i_audio_level} * 11'd320;
+    wire [9:0]  av_len  = av_prod[15:8];
+    wire in_av = ~boot_mode && i_audio_viz &&
+                 (x >= AV_X) && (x < AV_X + AV_W) &&
+                 (y >= AV_Y) && (y < AV_Y + AV_H);
+    wire in_av_bar = in_av && (x < AV_X + {1'b0, av_len});
+    wire [23:0] av_color = (x >= AV_X + {1'b0, av_len[9:1]}) ?
+                            24'hFFD166 : 24'h39D98A;
+
+    // ---- 字库 ROM ----
     wire [7:0] title_glyph;
     wire [7:0] ts_glyph;
     wire [7:0] bot_glyph;
+    wire [7:0] boot_glyph;
     font8x8 u_font_title (
         .i_char (title_char), .i_row (title_row), .o_row (title_glyph)
     );
@@ -355,23 +1257,55 @@ module osd_layer #(
     font8x8 u_font_bot (
         .i_char (bot_char), .i_row (bot_row), .o_row (bot_glyph)
     );
+    font8x8 u_font_boot (
+        .i_char (boot_char), .i_row (boot_row), .o_row (boot_glyph)
+    );
 
     // ---- 文本像素判定 ----
     wire title_pixel = in_title && title_glyph[7 - title_col];
     wire ts_pixel    = in_ts    && ts_glyph[7 - ts_col];
     wire bot_pixel   = in_bot   && bot_glyph[7 - bot_col];
+    wire boot_pixel  = boot_text_on && boot_glyph[7 - boot_col];
 
-    // ---- 输出混合（黑底白字，栏外透传原视频）----
+    // ---- 输出混合 ----
     reg [23:0] rgb_next;
     always @(*) begin
-        if (in_bar)
-            rgb_next = (title_pixel | ts_pixel) ? 24'hFFFFFF : 24'h000000;
+        if (in_lp_border)
+            rgb_next = mq_lit ? mq_color : 24'h101A2E;
+        else if (in_lp) begin
+            if (in_prg) begin
+                if (prg_edge)      rgb_next = 24'h2A5A8A;
+                else if (prg_lit)  rgb_next = 24'h2FD8FF;
+                else               rgb_next = 24'h101A2E;
+            end else if (in_div1)
+                rgb_next = 24'h1E4A66;
+            else if (boot_pixel)
+                rgb_next = boot_text_color;
+            else
+                rgb_next = 24'h05080F;
+        end
+        else if (in_rp_border)
+            rgb_next = 24'h1E5A7A;
+        else if (in_rp) begin
+            if (in_rhdiv || in_div2)
+                rgb_next = 24'h1E4A66;
+            else if (boot_pixel)
+                rgb_next = boot_text_color;
+            else
+                rgb_next = 24'h05080F;
+        end
+        else if (in_bar)
+            rgb_next = (title_pixel || ts_pixel) ? 24'hFFFFFF : 24'h000000;
         else if (in_bot_bar)
             rgb_next = bot_pixel ? 24'hFFFFFF : 24'h000000;
         else if (in_av)
-            rgb_next = in_av_bar ? 24'h00FF00 : 24'h202020;
-        else if (in_spec)
-            rgb_next = spec_color;
+            rgb_next = in_av_bar ? av_color : 24'h141A24;
+        else if (in_spec_panel) begin
+            if (spec_border)   rgb_next = 24'h2A6A8A;
+            else if (bar_pix)  rgb_next = spec_color;
+            else if (peak_pix) rgb_next = 24'hFFFFFF;
+            else               rgb_next = spec_bg;
+        end
         else
             rgb_next = i_rgb;
     end

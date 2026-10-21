@@ -63,7 +63,7 @@ wire        ctrl_audio_viz;
 wire        ctrl_audio_pause;
 wire        ctrl_spectrum_en;
 wire [7:0]  audio_level;
-wire [47:0] spec_level;
+wire [191:0] spec_level;
 
 // WAV 播放链
 wire        wav_active;
@@ -87,6 +87,9 @@ wire [23:0] osd_rgb;
 wire        display_valid;
 
 wire [3:0]  state_code;
+wire [2:0]  img_count;
+wire        sd_ready;
+wire        scan_done_sd;
 wire [6:0]  seg_data_0;
 wire [23:0] shown_bcd;
 wire [6:0]  seg_d0, seg_d1, seg_d2, seg_d3, seg_d4, seg_d5;
@@ -229,6 +232,9 @@ sd_card_bmp #(
     .key_next          (k2),
     .key_auto          (ctrl_auto_play),
     .state_code        (state_code),
+    .img_count         (img_count),
+    .sd_ready          (sd_ready),
+    .scan_done_o       (scan_done_sd),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
     .display_valid     (display_valid),
@@ -330,6 +336,25 @@ always @(posedge video_clk or posedge rst_all) begin
 end
 assign vout_data = display_valid_s2 ? vout_data_raw : 24'd0;
 
+// 启动状态跨域：100MHz 准静态电平 → video_clk 2 级同步
+reg        sd_ready_s1, sd_ready_s2;
+reg        scan_done_s1, scan_done_s2;
+reg [2:0]  img_count_s1, img_count_s2;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        sd_ready_s1  <= 1'b0;  sd_ready_s2  <= 1'b0;
+        scan_done_s1 <= 1'b0;  scan_done_s2 <= 1'b0;
+        img_count_s1 <= 3'd0;  img_count_s2 <= 3'd0;
+    end else begin
+        sd_ready_s1  <= sd_ready;
+        sd_ready_s2  <= sd_ready_s1;
+        scan_done_s1 <= scan_done_sd;
+        scan_done_s2 <= scan_done_s1;
+        img_count_s1 <= img_count;
+        img_count_s2 <= img_count_s1;
+    end
+end
+
 // ===================== UART 上位机标语接收 =====================
 uart_rx #(
     .CLK_FREQ (50_000_000),
@@ -430,6 +455,11 @@ osd_layer u_osd_layer(
     .i_audio_level(audio_level),
     .i_spectrum_en(ctrl_spectrum_en),
     .i_spec_level(spec_level),
+    .i_display_valid(display_valid_s2),
+    .i_sd_init_done(sd_ready_s2),
+    .i_scan_done(scan_done_s2),
+    .i_img_count(img_count_s2),
+    .i_auto_play(ctrl_auto_play),
     .o_hs       (),
     .o_vs       (osd_vs),
     .o_de       (osd_de),
@@ -582,7 +612,7 @@ audio_arc_calculate #(
     .O_acr_n       (acr_n)
 );
 
-// Goertzel 8 频段频谱分析（与 I2S_receiver 同域，供 OSD 频谱图）
+// Goertzel 32 频段频谱分析（与 I2S_receiver 同域，供 OSD 频谱图）
 audio_spectrum u_audio_spectrum (
     .I_clk         (video_clk),
     .I_rst         (rst_all),
