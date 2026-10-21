@@ -194,7 +194,7 @@ module osd_layer #(
     wire [10:0] title_off   = x - TITLE_X;
     wire [10:0] title_off_s = title_off + scroll_pos;
     wire [6:0]  title_char_idx = title_off_s >> 4;
-    wire [2:0]  title_col   = title_off_s[4:2];
+    wire [2:0]  title_col   = title_off_s[3:1];
     wire [10:0] title_v     = y - GLYPH_Y;
     wire [2:0]  title_row   = title_v[3:1];
     wire in_title_x = (x >= TITLE_X) && (x < TITLE_X + TITLE_LEN * CHAR_W);
@@ -1141,7 +1141,7 @@ module osd_layer #(
         end else if (in_gd) begin
             boot_char = guide_char(gd_line, gd_col);
             boot_row  = gd_row;
-            boot_col  = gd_col[2:0];
+            boot_col  = gd_offx[2:0];
             boot_text_on = 1'b1;
             boot_text_color = 24'hB8C6DC;
         end else if (in_sth) begin
@@ -1153,7 +1153,7 @@ module osd_layer #(
         end else if (in_st) begin
             boot_char = stat_char(st_line, st_col);
             boot_row  = st_row;
-            boot_col  = st_col[2:0];
+            boot_col  = st_offx[2:0];
             boot_text_on = 1'b1;
             boot_text_color = 24'hA8B8D0;
         end
