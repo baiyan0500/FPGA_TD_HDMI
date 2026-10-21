@@ -60,7 +60,20 @@ wire [2:0]  ctrl_bright;
 wire [2:0]  ctrl_contrast;
 wire        ctrl_auto_play;
 wire        ctrl_audio_viz;
+wire        ctrl_audio_pause;
+wire        ctrl_spectrum_en;
 wire [7:0]  audio_level;
+wire [47:0] spec_level;
+
+// WAV 播放链
+wire        wav_active;
+wire [32:0] wav_rate_step;
+wire        wav_stereo;
+wire        wav_fifo_rd_en;
+wire [15:0] wav_fifo_rd_data;
+wire        wav_fifo_empty;
+wire        wav_src_valid;
+wire signed [23:0] wav_src_l, wav_src_r;
 wire        uart_rx_done;
 wire [7:0]  uart_rx_data;
 wire [255:0] slogan_data;
@@ -112,9 +125,12 @@ wire        audio_mclk;
 wire        audio_i2s_bclk;
 wire        audio_i2s_lrck;
 wire        audio_i2s_dout;
-wire        audio_valid;
-wire [23:0] audio_left_data;
-wire [23:0] audio_right_data;
+wire        audio_i2s_tgl;            // audio_mclk 域帧 toggle
+wire [23:0] audio_left_mclk;         // audio_mclk 域帧样本（整帧稳定）
+wire [23:0] audio_right_mclk;
+reg         audio_valid;             // video_clk 域（toggle 同步后）
+reg  [23:0] audio_left_data;
+reg  [23:0] audio_right_data;
 wire        acr_valid;
 wire [19:0] acr_cts;
 wire [19:0] acr_n;
@@ -231,7 +247,16 @@ sd_card_bmp #(
     .SD_nCS            (sd_ncs),
     .SD_DCLK           (sd_dclk),
     .SD_MOSI           (sd_mosi),
-    .SD_MISO           (sd_miso)
+    .SD_MISO           (sd_miso),
+
+    .wav_pause         (ctrl_audio_pause),
+    .wav_active        (wav_active),
+    .wav_rate_step     (wav_rate_step),
+    .wav_stereo        (wav_stereo),
+    .wav_rd_clk        (audio_mclk),
+    .wav_fifo_rd_en    (wav_fifo_rd_en),
+    .wav_fifo_rd_data  (wav_fifo_rd_data),
+    .wav_fifo_empty    (wav_fifo_empty)
 );
 
 // 原始逻辑：数码管显示 SD 状态码 state_code（默认）
@@ -292,7 +317,18 @@ video_delay video_delay_m0(
 );
 
 // 首图提交前黑屏；提交后一直显示当前显示缓冲区内容
-assign vout_data = display_valid ? vout_data_raw : 24'd0;
+// display_valid 为 100MHz 域准静态电平（上电 0，首图提交后恒 1），2 级同步到 video_clk
+reg display_valid_s1, display_valid_s2;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        display_valid_s1 <= 1'b0;
+        display_valid_s2 <= 1'b0;
+    end else begin
+        display_valid_s1 <= display_valid;
+        display_valid_s2 <= display_valid_s1;
+    end
+end
+assign vout_data = display_valid_s2 ? vout_data_raw : 24'd0;
 
 // ===================== UART 上位机标语接收 =====================
 uart_rx #(
@@ -330,14 +366,16 @@ ctrl u_ctrl(
     .o_bright   (ctrl_bright),
     .o_contrast (ctrl_contrast),
     .o_auto_play(ctrl_auto_play),
-    .o_audio_viz(ctrl_audio_viz)
+    .o_audio_viz(ctrl_audio_viz),
+    .o_audio_pause(ctrl_audio_pause),
+    .o_spectrum_en(ctrl_spectrum_en)
 );
 
-// ===================== 音频幅度提取 + 峰值保持（audio_mclk 域）=====================
+// ===================== 音频幅度提取 + 峰值保持（video_clk 域，与 I2S 接收输出同域）=====================
 reg [7:0]  audio_amp;
 reg [7:0]  audio_peak;
 reg [15:0] audio_peak_cnt;
-always @(posedge audio_mclk or posedge rst_all) begin
+always @(posedge video_clk or posedge rst_all) begin
     if (rst_all) begin
         audio_amp <= 8'd0; audio_peak <= 8'd0; audio_peak_cnt <= 16'd0;
     end else begin
@@ -349,18 +387,7 @@ always @(posedge audio_mclk or posedge rst_all) begin
         audio_peak_cnt <= audio_peak_cnt + 16'd1;
     end
 end
-
-// 跨域到 video_clk（2 级同步）
-reg [7:0] audio_peak_s1, audio_peak_s2;
-always @(posedge video_clk or posedge rst_all) begin
-    if (rst_all) begin
-        audio_peak_s1 <= 8'd0; audio_peak_s2 <= 8'd0;
-    end else begin
-        audio_peak_s1 <= audio_peak;
-        audio_peak_s2 <= audio_peak_s1;
-    end
-end
-assign audio_level = audio_peak_s2;
+assign audio_level = audio_peak;   // 已在 video_clk 域，原跨域同步链不再需要
 
 // ===================== 亮度/对比度调节（按键 K3/K4）=====================
 brightness_contrast u_brightness_contrast(
@@ -401,6 +428,8 @@ osd_layer u_osd_layer(
     .i_slogan_scroll(slogan_scroll),
     .i_audio_viz(ctrl_audio_viz),
     .i_audio_level(audio_level),
+    .i_spectrum_en(ctrl_spectrum_en),
+    .i_spec_level(spec_level),
     .o_hs       (),
     .o_vs       (osd_vs),
     .o_de       (osd_de),
@@ -472,28 +501,75 @@ sdram U3(
     .Sdr_rd_dout       (Sdr_rd_dout)
 );
 
-// ===================== 音频：内部 I2S 测试音 =====================
+// ===================== 音频：WAV 音源（ASRC 到 48k）+ I2S 发射（WAV 优先，回退测试音） =====================
+// WAV 样本重采样（audio_mclk 域，读 sd_card_bmp 内 sd_card_wav 的跨时钟 FIFO）
+wav_i2s_source u_wav_i2s_source (
+    .I_mclk       (audio_mclk),
+    .I_rst        (rst_all),
+    .fifo_rd_en   (wav_fifo_rd_en),
+    .fifo_rd_data (wav_fifo_rd_data),
+    .fifo_empty   (wav_fifo_empty),
+    .i_active     (wav_active),
+    .i_pause      (ctrl_audio_pause),
+    .i_step       (wav_rate_step),
+    .i_stereo     (wav_stereo),
+    .o_valid      (wav_src_valid),
+    .o_l          (wav_src_l),
+    .o_r          (wav_src_r)
+);
+
 hdmi_audio_tone_i2s_64fs #(
     .PHASE_INC (32'd39370534),
     .AMP       (24'sd2000000)
 ) u_hdmi_audio_tone_i2s_64fs (
     .I_mclk      (audio_mclk),
     .I_rst       (rst_all),
+    .I_wav_sel   (wav_active),
+    .I_wav_valid (wav_src_valid),
+    .I_wav_l     (wav_src_l),
+    .I_wav_r     (wav_src_r),
+    .I_pause     (ctrl_audio_pause),
     .O_i2s_BCLK  (audio_i2s_bclk),
     .O_i2s_LRCK  (audio_i2s_lrck),
     .O_i2s_DOUT  (audio_i2s_dout)
 );
 
+// I2S 接收器挂 audio_mclk（与 I2S 发生器同源，2×BCLK 整数倍同步采样），
+// 输出经 toggle 同步跨到 video_clk 域（样本整帧稳定，边沿采样无亚稳风险）
 I2S_receiver u_I2S_receiver(
-    .I_clk              (video_clk),
+    .I_clk              (audio_mclk),
     .I_rst              (rst_all),
     .I_i2s_BCLK         (audio_i2s_bclk),
     .I_i2s_LRCK         (audio_i2s_lrck),
     .I_i2s_DOUT         (audio_i2s_dout),
-    .O_audio_valid      (audio_valid),
-    .O_audio_left_data  (audio_left_data),
-    .O_audio_right_data (audio_right_data)
+    .O_audio_toggle     (audio_i2s_tgl),
+    .O_audio_left_data  (audio_left_mclk),
+    .O_audio_right_data (audio_right_mclk)
 );
+
+// audio_mclk → video_clk：帧 toggle 3 级同步 + 边沿锁存样本
+reg [2:0] audio_tgl_sync;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all)
+        audio_tgl_sync <= 3'b0;
+    else
+        audio_tgl_sync <= {audio_tgl_sync[1:0], audio_i2s_tgl};
+end
+
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        audio_valid      <= 1'b0;
+        audio_left_data  <= 24'd0;
+        audio_right_data <= 24'd0;
+    end else begin
+        audio_valid <= audio_tgl_sync[2] ^ audio_tgl_sync[1];
+        if (audio_tgl_sync[2] ^ audio_tgl_sync[1]) begin
+            // toggle 翻转已同步 3 拍（120ns > 2 个源时钟周期），样本早已稳定
+            audio_left_data  <= audio_left_mclk;
+            audio_right_data <= audio_right_mclk;
+        end
+    end
+end
 
 audio_arc_calculate #(
     .ACR_N         (6144)
@@ -504,6 +580,15 @@ audio_arc_calculate #(
     .O_acr_valid   (acr_valid),
     .O_acr_cts     (acr_cts),
     .O_acr_n       (acr_n)
+);
+
+// Goertzel 8 频段频谱分析（与 I2S_receiver 同域，供 OSD 频谱图）
+audio_spectrum u_audio_spectrum (
+    .I_clk         (video_clk),
+    .I_rst         (rst_all),
+    .i_audio_valid (audio_valid),
+    .i_audio_left  (audio_left_data),
+    .o_level       (spec_level)
 );
 
 // ===================== RGB/DE 转 AXIS 视频 =====================

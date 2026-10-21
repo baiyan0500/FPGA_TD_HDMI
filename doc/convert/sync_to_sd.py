@@ -4,34 +4,30 @@ import glob
 import shutil
 import argparse
 
-def corrupt_old_bmp_headers(target_drive):
+def corrupt_old_headers(target_drive):
     """
-    遍历目标驱动器下的所有 .bmp 文件，将其开头的 'BM' 魔数修改为 'XX'。
-    这样 FPGA 的物理扇区扫描就不会把这些“被标记为删除但物理数据还在”的文件识别为有效图片。
+    遍历目标驱动器下的所有 .bmp / .wav 文件，将其开头的魔数（'BM' / 'RIFF'）破坏。
+    这样 FPGA 的物理扇区扫描就不会把这些"被标记为删除但物理数据还在"的文件识别为有效内容。
     """
-    print(f"正在扫描 {target_drive} 驱动器，准备清除旧图片的 BMP 识别头...")
-    
-    # 查找根目录下的所有 bmp 文件（你也可以用 os.walk 查找所有子目录）
-    search_pattern = os.path.join(target_drive, "*.bmp")
-    bmp_files = glob.glob(search_pattern)
-    
+    print(f"正在扫描 {target_drive} 驱动器，准备清除旧图片/音频的识别头...")
+
     corrupt_count = 0
-    for bmp_file in bmp_files:
-        try:
-            # 以读写模式打开文件（不截断）
-            with open(bmp_file, 'r+b') as f:
-                header = f.read(2)
-                if header == b'BM':
-                    # 将指针移回开头
-                    f.seek(0)
-                    # 写入随意字符破坏魔数，例如 'XX'
-                    f.write(b'XX')
-                    corrupt_count += 1
-                    print(f"  [清除有效] 已破坏头文件: {os.path.basename(bmp_file)}")
-        except Exception as e:
-            print(f"  [警告] 无法处理文件 {bmp_file}: {e}")
-            
-    print(f"头文件清除完毕，共处理了 {corrupt_count} 个旧图片文件。")
+    for pattern, magic in ((os.path.join(target_drive, "*.bmp"), b'BM'),
+                           (os.path.join(target_drive, "*.wav"), b'RIFF')):
+        for fpath in glob.glob(pattern):
+            try:
+                # 以读写模式打开文件（不截断）
+                with open(fpath, 'r+b') as f:
+                    header = f.read(len(magic))
+                    if header == magic:
+                        f.seek(0)
+                        f.write(b'XX')   # 破坏魔数，使其不再匹配
+                        corrupt_count += 1
+                        print(f"  [清除有效] 已破坏头文件: {os.path.basename(fpath)}")
+            except Exception as e:
+                print(f"  [警告] 无法处理文件 {fpath}: {e}")
+
+    print(f"头文件清除完毕，共处理了 {corrupt_count} 个旧文件。")
 
 def clean_drive(target_drive):
     """
@@ -89,6 +85,36 @@ def sync_new_images(source_dir, target_drive, max_count=4):
             print(f"  [同步失败] {filename}: {e}")
             
     print(f"\n同步完成！成功写入 {success_count} 张新图片。")
+
+
+def sync_wav_audio(source_dir, target_drive):
+    """
+    从源文件夹中挑选 1 个 WAV 音频（按名称排序取第一个），复制到目标驱动器。
+    FPGA 侧要求：16bit PCM（mono/stereo），采样率 8k/11.025k/16k/22.05k/24k/32k/44.1k/48k。
+    建议 WAV 尺寸不超过几十 MB：文件过大时 FAT 可能产生碎片，导致连续扇区读取错乱。
+    """
+    if not os.path.exists(source_dir):
+        print(f"\n[提示] 源文件夹不存在: {source_dir}，跳过音频同步。")
+        return
+
+    wav_files = glob.glob(os.path.join(source_dir, "*.wav"))
+    if not wav_files:
+        print(f"\n[提示] 源文件夹 {source_dir} 中没有找到 WAV 音频，跳过音频同步。")
+        return
+
+    wav_files.sort()
+    wav_file = wav_files[0]
+
+    try:
+        filename = os.path.basename(wav_file)
+        target_name = f"a_{filename}"   # 'a_' 前缀确保排在图片之后写入（FAT 顺序分配更连续）
+        target_path = os.path.join(target_drive, target_name)
+        shutil.copy2(wav_file, target_path)
+        size_mb = os.path.getsize(wav_file) / (1024 * 1024)
+        print(f"\n  [音频同步成功] {filename} -> {target_name} ({size_mb:.1f} MB)")
+    except Exception as e:
+        print(f"  [音频同步失败] {wav_file}: {e}")
+
     print("你现在可以安全弹出 SD 卡，插入 FPGA 开发板了。")
 
 if __name__ == "__main__":
@@ -128,11 +154,14 @@ if __name__ == "__main__":
             print("操作已取消。")
             sys.exit(0)
 
-    # 步骤 1: 破坏旧 BMP 的物理文件头
-    corrupt_old_bmp_headers(target_drive)
-    
+    # 步骤 1: 破坏旧 BMP/WAV 的物理文件头
+    corrupt_old_headers(target_drive)
+
     # 步骤 2: 清空 SD 卡（从文件系统层面）
     clean_drive(target_drive)
-    
+
     # 步骤 3: 复制新图片
     sync_new_images(source_dir, target_drive, max_count=args.num)
+
+    # 步骤 4: 复制 WAV 音频（图片之后写入，保证物理扇区顺序：图片 → 音频）
+    sync_wav_audio(source_dir, target_drive)

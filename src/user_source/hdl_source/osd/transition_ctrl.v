@@ -46,6 +46,9 @@ module transition_ctrl #(
     reg       vs_d;
     wire      vs_rise = i_vs & ~vs_d;
 
+    // 上电 alpha=256 保持全亮：首图加载后 display_valid 拉高即可立即显示，
+    // 避免从 0 开始 fade 导致首图出现黑屏/白屏闪烁
+
     // 像素位置跟踪
     reg [10:0] x, y;
     reg        de_d;
@@ -76,14 +79,14 @@ module transition_ctrl #(
     always @(posedge i_clk or posedge i_rst) begin
         if (i_rst) begin
             state    <= S_IDLE;
-            alpha    <= 9'd256;
+            alpha    <= 9'd256;                     // 上电保持全亮，首图直接显示
             boundary <= 11'd0;
             o_swap   <= 1'b0;
             pend_req <= 1'b0;
         end else begin
             case (state)
                 S_IDLE: begin
-                    alpha <= 9'd256;
+                    alpha <= 9'd256;                // 空闲时保持全亮
                     if (req_edge || pend_req) begin
                         pend_req <= 1'b0;
                         state    <= S_OUT;
@@ -150,7 +153,9 @@ module transition_ctrl #(
 
     reg [23:0] o_rgb_c;
     always @(*) begin
-        if (i_mode == 2'd0)
+        if (state == S_IDLE)
+            o_rgb_c = i_rgb;                    // 空闲时透传，避免模式切换瞬间 boundary=0 导致黑屏
+        else if (i_mode == 2'd0)
             o_rgb_c = {fade_r, fade_g, fade_b};
         else
             o_rgb_c = wipe_on ? i_rgb : 24'd0;

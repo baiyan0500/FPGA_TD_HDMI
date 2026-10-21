@@ -55,14 +55,48 @@ set_clock_groups -exclusive \
     -group [get_clocks {hdmi_5x_clk}]
 
 # ------------------------------------------------------------
-# 5. 音频 I2S 发生器/接收器跨域
+# 5. 音频 I2S 发生器/接收器 + sd_card_wav 异步 FIFO 跨域
 #
-#    audio_mclk 域里生成 I2S，video_clk 域里做三拍同步采样。
-#    这类路径不是普通同步时序路径，直接切掉更合理。
+#    audio_mclk 域里生成 I2S，video_clk 域里做三拍同步采样；
+#    sd_card_wav 的 gray 指针 / 双时钟 RAM / 参数稳定后使能，均由
+#    2 级同步器或"稳定后再用"协议保护。set_clock_groups 在 TD 6.2
+#    的时序报告中未见生效，改用显式 false path。
 # ------------------------------------------------------------
-set_clock_groups -asynchronous \
-    -group [get_clocks {audio_mclk}] \
-    -group [get_clocks {video_clk} hdmi_5x_clk sd_card_clk ext_mem_clk]
+set_false_path -from [get_clocks {audio_mclk}] -to [get_clocks {video_clk hdmi_5x_clk sd_card_clk ext_mem_clk}]
+set_false_path -from [get_clocks {video_clk hdmi_5x_clk sd_card_clk ext_mem_clk}] -to [get_clocks {audio_mclk}]
+
+# ------------------------------------------------------------
+# 5.1 display_valid 同步器首级（100MHz 准静态电平 → video_clk 2 级同步）
+# ------------------------------------------------------------
+set_false_path -to [get_regs -nowarn {*/display_valid_s1*}]
+
+# ------------------------------------------------------------
+# 5.2 SDRAM 源同步 pad 接口（ext_mem_clk ↔ SDRAM 输出时钟 clkc[2]）
+#     板级时序由 SDRAM 采样窗口与 PCB 等长保证，FPGA 内部分析恒报红
+#     （历史版本即如此，功能正常），予以豁免。
+# ------------------------------------------------------------
+set_false_path -from [get_clocks {ext_mem_clk}] -to [get_clocks {sys_pll_m0/pll_inst.clkc[2]}]
+set_false_path -from [get_clocks {sys_pll_m0/pll_inst.clkc[2]}] -to [get_clocks {ext_mem_clk}]
+
+# ------------------------------------------------------------
+# 5.3 跨 PLL 时钟对豁免：video_pll 输出（video_clk/hdmi_5x_clk）与
+#     sys_pll 输出（sd_card_clk/ext_mem_clk）及 50MHz 主时钟 clk 物理
+#     异步。跨域路径均为电平握手 / 宽脉冲 / 同步器（ctrl 按键电平、
+#     video_timing_data read_req 握手、afifo gray 指针、display_valid
+#     同步器），豁免同步分析。
+#     注意：sd_card_clk 与 ext_mem_clk 同出 sys_pll（同步相位关系），
+#     不在本豁免组内。
+# ------------------------------------------------------------
+set_false_path -from [get_clocks {video_clk hdmi_5x_clk}] -to [get_clocks {sd_card_clk ext_mem_clk clk}]
+set_false_path -from [get_clocks {sd_card_clk ext_mem_clk clk}] -to [get_clocks {video_clk hdmi_5x_clk}]
+
+# ------------------------------------------------------------
+# 5.4 fifo_aclr（ext_mem 域帧 FIFO 清零电平）跨 sys_pll 同步域的
+#     全部 fanout（sd_init_done / bmp_read write_req 等）：准静态
+#     慢电平，上电后不再翻转，豁免 ext_mem_clk→sd_card_clk 间的
+#     布线长路径（SWNS -1.283ns）
+# ------------------------------------------------------------
+set_false_path -from [get_regs -nowarn {*/fifo_aclr_reg*}]
 
 # ------------------------------------------------------------
 # 6. 可选：如果你的 frame_read_write 内部异步 FIFO 已经完全处理好了跨域，

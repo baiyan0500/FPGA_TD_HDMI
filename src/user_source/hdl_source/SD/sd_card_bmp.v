@@ -28,7 +28,17 @@ module sd_card_bmp #(
     output                      SD_nCS,
     output                      SD_DCLK,
     output                      SD_MOSI,
-    input                       SD_MISO
+    input                       SD_MISO,
+
+    // ---- WAV 播放（层3）----
+    input                       wav_pause,        // 暂停电平（video_clk 域，内部 2 级同步）
+    output                      wav_active,       // WAV 播放有效（100MHz 域电平）
+    output      [32:0]          wav_rate_step,    // ASRC 步进（33bit）
+    output                      wav_stereo,       // 1=立体声
+    input                       wav_rd_clk,       // FIFO 读时钟（audio_mclk 12.288MHz）
+    input                       wav_fifo_rd_en,   // FIFO 读使能（audio_mclk 域）
+    output      [15:0]          wav_fifo_rd_data, // FIFO 读数据（FWFT）
+    output                      wav_fifo_empty    // FIFO 空标志
 );
 
 wire key_next_press;
@@ -54,6 +64,30 @@ wire             scan_done;
 wire             scan_found_valid;
 wire [31:0]      scan_found_sector;
 wire [2:0]       scan_found_total;
+
+// ---- WAV 客户端 ----
+wire             wav_found;
+wire [31:0]      wav_start_sector;
+wire             wav_bus_req;
+wire             wav_sd_read;
+wire [31:0]      wav_sd_addr;
+wire             wav_data_valid;
+wire             wav_read_end;
+wire             wav_pause_s;
+reg  [1:0]       wav_pause_sync;
+
+// ---- SD 总线仲裁 ----
+reg              grant_wav;
+reg              bmp_rd_busy;
+reg              wav_rd_busy;
+wire             want_wav = wav_bus_req;
+wire             bmp_data_valid_g = !grant_wav && sd_sec_read_data_valid;
+wire             bmp_read_end_g   = !grant_wav && sd_sec_read_end;
+wire             sd_sec_read_mux  = grant_wav ? wav_sd_read : sd_sec_read;
+wire [31:0]      sd_sec_addr_mux  = grant_wav ? wav_sd_addr  : sd_sec_read_addr;
+// WAV 客户端数据/结束信号按 grant 门控分发（此前缺失驱动导致 wav_rd_busy 永不清零、总线锁死）
+assign wav_data_valid = grant_wav && sd_sec_read_data_valid;
+assign wav_read_end   = grant_wav && sd_sec_read_end;
 
 reg              scan_start_pulse;
 reg              load_start_pulse;
@@ -125,6 +159,47 @@ always @(posedge clk or posedge rst) begin
         auto_play_sync <= 3'd0;
     else
         auto_play_sync <= {auto_play_sync[1:0], key_auto};
+end
+
+// WAV 暂停电平同步（video_clk → 100MHz）
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        wav_pause_sync <= 2'b00;
+    else
+        wav_pause_sync <= {wav_pause_sync[0], wav_pause};
+end
+assign wav_pause_s = wav_pause_sync[1];
+
+// ---------------------------------------------------------------------------
+// SD 总线仲裁：bmp_read 与 sd_card_wav 共享 sd_card_top
+//   · 切换仅在"双方均无在途扇区且无挂起请求"的拍发生（扇区边界）
+//   · want_wav=1 时 bmp_read 被 i_stall 背压，在扇区边界让出总线
+//   · bmp_rd_busy/wav_rd_busy 跟踪在途扇区，保证 read_end 分发回发起方
+// ---------------------------------------------------------------------------
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        grant_wav    <= 1'b0;
+        bmp_rd_busy  <= 1'b0;
+        wav_rd_busy  <= 1'b0;
+    end else begin
+        // bmp 侧在途跟踪
+        if (!grant_wav && !bmp_rd_busy && sd_sec_read)
+            bmp_rd_busy <= 1'b1;
+        else if (!grant_wav && bmp_read_end_g)
+            bmp_rd_busy <= 1'b0;
+
+        // wav 侧在途跟踪
+        if (grant_wav && !wav_rd_busy && wav_sd_read)
+            wav_rd_busy <= 1'b1;
+        else if (grant_wav && wav_read_end)
+            wav_rd_busy <= 1'b0;
+
+        // 总线授予切换
+        if (!grant_wav && want_wav && !bmp_rd_busy && !sd_sec_read)
+            grant_wav <= 1'b1;
+        else if (grant_wav && !want_wav && !wav_rd_busy && !wav_sd_read)
+            grant_wav <= 1'b0;
+    end
 end
 
 function [2:0] next_index_limited;
@@ -317,7 +392,9 @@ always @(posedge clk or posedge rst) begin
             end else if (load_busy) begin
                 // 超时覆盖 swap_pending：防止 fade 握手丢失时 swap_pending 永久挂起导致 K2 彻底失效。
                 // 2s 阈值 > 最坏正常时长（装载约 0.5s + fade 全程转场约 0.54s）
-                if (load_timeout_cnt > 32'd200_000_000) begin
+                if (want_wav) begin
+                    // WAV 补水占用 SD 总线：装载等待，不计超时
+                end else if (load_timeout_cnt > 32'd200_000_000) begin
                     // 超时（例如读到坏图或截断的文件导致死锁），强制释放 busy 以恢复按键响应
                     load_busy             <= 1'b0;
                     load_timeout_cnt      <= 32'd0;
@@ -437,6 +514,8 @@ bmp_read bmp_read_m0(
     .scan_found_valid       (scan_found_valid),
     .scan_found_sector      (scan_found_sector),
     .scan_found_total       (scan_found_total),
+    .wav_found              (wav_found),
+    .wav_start_sector       (wav_start_sector),
 
     .load_start             (load_start_pulse),
     .load_abort             (load_abort),
@@ -451,13 +530,13 @@ bmp_read bmp_read_m0(
     .sd_sec_read            (sd_sec_read),
     .sd_sec_read_addr       (sd_sec_read_addr),
     .sd_sec_read_data       (sd_sec_read_data),
-    .sd_sec_read_data_valid (sd_sec_read_data_valid),
-    .sd_sec_read_end        (sd_sec_read_end),
+    .sd_sec_read_data_valid (bmp_data_valid_g),
+    .sd_sec_read_end        (bmp_read_end_g),
     .bmp_data_wr_en         (bmp_data_wr_en),
     .bmp_data               (bmp_data),
     .src_width              (src_width),
     .src_height             (src_height),
-    .i_stall                (scale_almost_full)
+    .i_stall                (scale_almost_full | want_wav)
 );
 
 scaler u_scaler(
@@ -482,8 +561,8 @@ sd_card_top sd_card_top_m0(
     .SD_MOSI                (SD_MOSI),
     .SD_MISO                (SD_MISO),
     .sd_init_done           (sd_init_done),
-    .sd_sec_read            (sd_sec_read),
-    .sd_sec_read_addr       (sd_sec_read_addr),
+    .sd_sec_read            (sd_sec_read_mux),
+    .sd_sec_read_addr       (sd_sec_addr_mux),
     .sd_sec_read_data       (sd_sec_read_data),
     .sd_sec_read_data_valid (sd_sec_read_data_valid),
     .sd_sec_read_end        (sd_sec_read_end),
@@ -492,6 +571,34 @@ sd_card_top sd_card_top_m0(
     .sd_sec_write_data      (),
     .sd_sec_write_data_req  (),
     .sd_sec_write_end       ()
+);
+
+// ---------------------------------------------------------------------------
+// WAV 解析 + 播放补水客户端（与 bmp_read 共享 sd_card_top，见上方仲裁器）
+// ---------------------------------------------------------------------------
+sd_card_wav #(
+    .CLK_FREQ_HZ            (CLK_FREQ_HZ)
+) u_sd_card_wav (
+    .clk                    (clk),
+    .rst                    (rst),
+    .i_scan_done            (scan_done),
+    .i_wav_found            (wav_found),
+    .i_wav_start_sector     (wav_start_sector),
+    .i_pause                (wav_pause_s),
+    .o_bus_req              (wav_bus_req),
+    .i_bus_grant            (grant_wav),
+    .sd_sec_read            (wav_sd_read),
+    .sd_sec_addr            (wav_sd_addr),
+    .sd_sec_data            (sd_sec_read_data),
+    .sd_sec_data_valid      (wav_data_valid),
+    .sd_sec_read_end        (wav_read_end),
+    .fifo_rd_clk            (wav_rd_clk),
+    .fifo_rd_en             (wav_fifo_rd_en),
+    .fifo_rd_data           (wav_fifo_rd_data),
+    .fifo_empty             (wav_fifo_empty),
+    .o_active               (wav_active),
+    .o_rate_step            (wav_rate_step),
+    .o_stereo               (wav_stereo)
 );
 
 // ---- 播放次数 BCD 加 1（6 位 BCD）----

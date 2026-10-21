@@ -29,6 +29,8 @@ module osd_layer #(
     input  wire        i_slogan_scroll,// 滚动使能
     input  wire        i_audio_viz,    // 音频可视化使能
     input  wire [7:0]  i_audio_level,  // 音频电平 0~255
+    input  wire        i_spectrum_en,  // 频谱图显示使能（层3 K4）
+    input  wire [47:0] i_spec_level,   // 8 频段 × 6bit 电平
 
     output reg         o_hs,
     output reg         o_vs,
@@ -184,6 +186,45 @@ module osd_layer #(
     wire in_av     = i_audio_viz && (x >= AV_X) && (x < AV_X + AV_W) && (y >= AV_Y) && (y < AV_Y + AV_H);
     wire in_av_bar = in_av && (x < AV_X + {1'b0, av_len});
 
+    // ---- 音频频谱图（8 竖条，层3 K4 开关）----
+    // 布局：x 52~587（条宽 60、间隔 8），y 316~443（高 128），条高 = level×2
+    localparam [10:0] SPEC_X0 = 11'd52;
+    localparam [10:0] SPEC_Y0 = 11'd316;
+    localparam [10:0] SPEC_XW = 11'd536;
+    localparam [10:0] SPEC_YH = 11'd128;
+    wire [10:0] spec_sx = x - SPEC_X0;                      // 区域内列
+    wire [10:0] spec_dy = y - SPEC_Y0;
+    wire [10:0] spec_sy = (SPEC_YH - 11'd1) - spec_dy;      // 像素距底部高度
+    wire in_spec_area = i_spectrum_en && (x >= SPEC_X0) && (x < SPEC_X0 + SPEC_XW) &&
+                        (y >= SPEC_Y0) && (y < SPEC_Y0 + SPEC_YH);
+
+    reg [3:0] spec_band;    // 0~7 有效，8=间隙/无效
+    reg [6:0] spec_col;     // 步进 68 内的列
+    always @(*) begin
+        if      (spec_sx < 11'd68 ) begin spec_band = 4'd0; spec_col = spec_sx[6:0]; end
+        else if (spec_sx < 11'd136) begin spec_band = 4'd1; spec_col = spec_sx - 11'd68;  end
+        else if (spec_sx < 11'd204) begin spec_band = 4'd2; spec_col = spec_sx - 11'd136; end
+        else if (spec_sx < 11'd272) begin spec_band = 4'd3; spec_col = spec_sx - 11'd204; end
+        else if (spec_sx < 11'd340) begin spec_band = 4'd4; spec_col = spec_sx - 11'd272; end
+        else if (spec_sx < 11'd408) begin spec_band = 4'd5; spec_col = spec_sx - 11'd340; end
+        else if (spec_sx < 11'd476) begin spec_band = 4'd6; spec_col = spec_sx - 11'd408; end
+        else                          begin spec_band = 4'd7; spec_col = spec_sx - 11'd476; end
+    end
+
+    wire [5:0] spec_lvl = (spec_band == 4'd0) ? i_spec_level[5:0]   :
+                          (spec_band == 4'd1) ? i_spec_level[11:6]  :
+                          (spec_band == 4'd2) ? i_spec_level[17:12] :
+                          (spec_band == 4'd3) ? i_spec_level[23:18] :
+                          (spec_band == 4'd4) ? i_spec_level[29:24] :
+                          (spec_band == 4'd5) ? i_spec_level[35:30] :
+                          (spec_band == 4'd6) ? i_spec_level[41:36] :
+                                                i_spec_level[47:42];
+    wire [6:0] spec_bar_h = {spec_lvl, 1'b0};               // 条高 0~126
+    wire in_spec = in_spec_area && (spec_col < 7'd60) && (spec_sy < {1'b0, spec_bar_h});
+    wire [23:0] spec_color = (spec_sy >= 11'd112) ? 24'hFF0000 :  // 顶部红
+                             (spec_sy >= 11'd88)  ? 24'hFFFF00 :  // 中部黄
+                                                    24'h00FF00;   // 底部绿
+
     // ---- 标语锁存（跨域）+ 平滑滚动 ----
     reg [7:0] slogan [0:31];
     reg [5:0] slogan_len;
@@ -329,6 +370,8 @@ module osd_layer #(
             rgb_next = bot_pixel ? 24'hFFFFFF : 24'h000000;
         else if (in_av)
             rgb_next = in_av_bar ? 24'h00FF00 : 24'h202020;
+        else if (in_spec)
+            rgb_next = spec_color;
         else
             rgb_next = i_rgb;
     end

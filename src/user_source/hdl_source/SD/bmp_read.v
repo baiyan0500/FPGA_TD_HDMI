@@ -12,6 +12,8 @@ module bmp_read(
     output reg                  scan_found_valid,
     output reg [31:0]           scan_found_sector,
     output reg [2:0]            scan_found_total,
+    output reg                  wav_found,          // 扫描发现 WAV 文件
+    output reg [31:0]           wav_start_sector,   // WAV 起始扇区
 
     // 按指定扇区加载一张图到 SDRAM
     input                       load_start,
@@ -62,25 +64,43 @@ reg [31:0] load_sector_latched;
 reg [31:0] bmp_len_cnt;
 reg [1:0]  bmp_byte_idx;
 
+// RIFF/WAVE 头锁存（扫描期识别 WAV 文件）
+reg [7:0]  riff_id0, riff_id1, riff_id2, riff_id3;
+reg [7:0]  wave_id0, wave_id1, wave_id2, wave_id3;
+reg [31:0] riff_size;
+reg [8:0]  post_scan_cnt;     // 图满后继续找 WAV 的空闲扇区预算
+
 wire header_match;
+wire wav_match;
 wire bmp_data_valid;
-wire [31:0] file_sector_count;
 wire [31:0] next_scan_sector_if_match;
 wire [31:0] next_scan_sector_if_miss;
+wire [31:0] next_scan_sector_if_wav;
+
+// 扇区跳转数预计算寄存：头字节锁存拍完成 32bit 加法/移位，扫描状态机
+// 关键路径上只剩"scan_sector + 预计算值"一级加法（否则两级 32bit 运算
+// 串联直驱 sd_sec_read_addr/scan_sector，100MHz 下 SWNS -3.661ns）
+reg  [31:0] file_sector_count_q;   // BMP：rd_cnt==5 算粗值，==6 修正 0→1
+reg  [31:0] wav_skip_sectors_q;    // WAV：rd_cnt==7 算粗值，==8 修正 0→1
 
 assign ready = (state == ST_IDLE);
 assign header_match = (header_0 == "B") &&
                       (header_1 == "M") &&
                       (bit_count    == 16'd24) &&
                       (compression  == 32'd0);
+assign wav_match = (riff_id0 == "R") && (riff_id1 == "I") &&
+                   (riff_id2 == "F") && (riff_id3 == "F") &&
+                   (wave_id0 == "W") && (wave_id1 == "A") &&
+                   (wave_id2 == "V") && (wave_id3 == "E");
 assign src_width  = width[15:0];
 assign src_height = height[15:0];
 assign bmp_data_valid = (sd_sec_read_data_valid == 1'b1) &&
                         (bmp_len_cnt >= pixel_offset) &&
                         (bmp_len_cnt <  file_len);
-assign file_sector_count = (file_len == 32'd0) ? 32'd1 : ((file_len + 32'd511) >> 9);
-assign next_scan_sector_if_match = scan_sector + file_sector_count;
+assign next_scan_sector_if_match = scan_sector + file_sector_count_q;
 assign next_scan_sector_if_miss  = scan_sector + 32'd1;
+// RIFF size = 文件长度 - 8，占 (riff_size + 8 + 511) >> 9 个扇区
+assign next_scan_sector_if_wav   = scan_sector + wav_skip_sectors_q;
 
 always @(posedge clk or posedge rst) begin
     if (rst) begin
@@ -105,18 +125,71 @@ always @(posedge clk or posedge rst) begin
         height       <= 32'd0;
         bit_count    <= 16'd0;
         compression  <= 32'd0;
+        riff_id0     <= 8'd0;
+        riff_id1     <= 8'd0;
+        riff_id2     <= 8'd0;
+        riff_id3     <= 8'd0;
+        wave_id0     <= 8'd0;
+        wave_id1     <= 8'd0;
+        wave_id2     <= 8'd0;
+        wave_id3     <= 8'd0;
+        riff_size    <= 32'd0;
+        file_sector_count_q <= 32'd1;
+        wav_skip_sectors_q  <= 32'd1;
     end else if (((state == ST_SCAN) || (state == ST_LOAD_HDR)) && sd_sec_read_data_valid) begin
         case (rd_cnt)
-            10'd0 : header_0 <= sd_sec_read_data;
-            10'd1 : header_1 <= sd_sec_read_data;
+            10'd0 : begin
+                header_0 <= sd_sec_read_data;
+                riff_id0 <= sd_sec_read_data;
+            end
+            10'd1 : begin
+                header_1 <= sd_sec_read_data;
+                riff_id1 <= sd_sec_read_data;
+            end
 
-            10'd2 : file_len[7:0] <= sd_sec_read_data;
-            10'd3 : file_len[15:8] <= sd_sec_read_data;
-            10'd4 : file_len[23:16] <= sd_sec_read_data;
-            10'd5 : file_len[31:24] <= sd_sec_read_data;
+            10'd2 : begin
+                file_len[7:0]   <= sd_sec_read_data;
+                riff_id2        <= sd_sec_read_data;
+            end
+            10'd3 : begin
+                file_len[15:8]  <= sd_sec_read_data;
+                riff_id3        <= sd_sec_read_data;
+            end
 
-            10'd10: pixel_offset[7:0] <= sd_sec_read_data;
-            10'd11: pixel_offset[15:8] <= sd_sec_read_data;
+            10'd4 : begin
+                file_len[23:16] <= sd_sec_read_data;
+                riff_size[7:0]  <= sd_sec_read_data;
+            end
+            10'd5 : begin
+                file_len[31:24] <= sd_sec_read_data;
+                riff_size[15:8] <= sd_sec_read_data;
+                // BMP 跳转扇区数：file_len 32bit 到齐，本拍算粗值（仅到寄存器 D）
+                // 小端：字节 5 是 MSB，须放拼接最高位（{旧[23:0],新} 会把值错移 8 位）
+                file_sector_count_q <= ({sd_sec_read_data, file_len[23:0]} + 32'd511) >> 9;
+            end
+            10'd6 : begin
+                riff_size[23:16] <= sd_sec_read_data;
+                file_sector_count_q <= (file_sector_count_q == 32'd0) ? 32'd1 : file_sector_count_q;
+            end
+            10'd7 : begin
+                riff_size[31:24] <= sd_sec_read_data;
+                // WAV 跳转扇区数：riff_size 32bit 到齐，本拍算粗值
+                // 小端：字节 7 是 MSB，须放拼接最高位
+                wav_skip_sectors_q <= ({sd_sec_read_data, riff_size[23:0]} + 32'd519) >> 9;
+            end
+            10'd8 : begin
+                wave_id0 <= sd_sec_read_data;
+                wav_skip_sectors_q <= (wav_skip_sectors_q == 32'd0) ? 32'd1 : wav_skip_sectors_q;
+            end
+            10'd9 : wave_id1 <= sd_sec_read_data;
+            10'd10: begin
+                wave_id2 <= sd_sec_read_data;
+                pixel_offset[7:0] <= sd_sec_read_data;
+            end
+            10'd11: begin
+                wave_id3 <= sd_sec_read_data;
+                pixel_offset[15:8] <= sd_sec_read_data;
+            end
             10'd12: pixel_offset[23:16] <= sd_sec_read_data;
             10'd13: pixel_offset[31:24] <= sd_sec_read_data;
 
@@ -206,6 +279,9 @@ always @(posedge clk or posedge rst) begin
         scan_found_valid  <= 1'b0;
         scan_found_sector <= 32'd0;
         scan_found_total  <= 3'd0;
+        wav_found         <= 1'b0;
+        wav_start_sector  <= 32'd0;
+        post_scan_cnt     <= 9'd0;
         scan_sector       <= 32'd0;
         load_sector_latched <= 32'd0;
     end else if (!sd_init_done) begin
@@ -218,6 +294,9 @@ always @(posedge clk or posedge rst) begin
         scan_found_valid  <= 1'b0;
         scan_found_sector <= 32'd0;
         scan_found_total  <= 3'd0;
+        wav_found         <= 1'b0;
+        wav_start_sector  <= 32'd0;
+        post_scan_cnt     <= 9'd0;
         scan_sector       <= 32'd0;
         load_sector_latched <= 32'd0;
     end else if (load_abort) begin
@@ -263,19 +342,41 @@ always @(posedge clk or posedge rst) begin
                         scan_found_sector <= scan_sector;
                         scan_found_total  <= scan_found_total + 3'd1;
 
-                        if ((scan_found_total + 3'd1 >= scan_target_count) || (next_scan_sector_if_match > scan_max_sector)) begin
-                            scan_done        <= 1'b1;
-                            state            <= ST_IDLE;
-                            sd_sec_read_addr <= next_scan_sector_if_match;
-                            scan_sector      <= next_scan_sector_if_match;
-                        end else begin
-                            sd_sec_read_addr <= next_scan_sector_if_match;
-                            scan_sector      <= next_scan_sector_if_match;
+                        if (scan_found_total + 3'd1 >= scan_target_count)
+                            post_scan_cnt <= 9'd256;   // 图满后继续找 WAV 的空闲扇区预算
+
+                        if (((scan_found_total + 3'd1 >= scan_target_count) && wav_found) ||
+                            (next_scan_sector_if_match > scan_max_sector)) begin
+                            scan_done <= 1'b1;
+                            state     <= ST_IDLE;
                         end
+                        sd_sec_read_addr <= next_scan_sector_if_match;
+                        scan_sector      <= next_scan_sector_if_match;
+                    end else if (wav_match) begin
+                        // WAV 文件：记录起始扇区，按 RIFF size 整体跳过
+                        wav_found        <= 1'b1;
+                        wav_start_sector <= scan_sector;
+
+                        if (scan_found_total >= scan_target_count) begin
+                            scan_done <= 1'b1;
+                            state     <= ST_IDLE;
+                        end
+                        sd_sec_read_addr <= next_scan_sector_if_wav;
+                        scan_sector      <= next_scan_sector_if_wav;
                     end else begin
                         if (scan_sector >= scan_max_sector) begin
                             scan_done <= 1'b1;
                             state     <= ST_IDLE;
+                        end else if (scan_found_total >= scan_target_count) begin
+                            // 图已满但未遇 WAV：限额扫描空闲扇区
+                            if (post_scan_cnt == 9'd0) begin
+                                scan_done <= 1'b1;
+                                state     <= ST_IDLE;
+                            end else begin
+                                post_scan_cnt   <= post_scan_cnt - 9'd1;
+                                sd_sec_read_addr <= next_scan_sector_if_miss;
+                                scan_sector      <= next_scan_sector_if_miss;
+                            end
                         end else begin
                             sd_sec_read_addr <= next_scan_sector_if_miss;
                             scan_sector      <= next_scan_sector_if_miss;

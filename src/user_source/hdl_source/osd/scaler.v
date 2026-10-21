@@ -36,7 +36,8 @@ module scaler #(
     end
 
     // ---- 输入 FIFO ----
-    reg [23:0] fifo_mem [0:FIFO_DEPTH-1];
+    // 强制 block_ram：512x24 = 12kbit，LUT RAM 实现会吃掉 ~1.5k LUT 加剧布线拥塞
+    (* ramstyle = "block_ram", ram_style = "block_ram" *) reg [23:0] fifo_mem [0:FIFO_DEPTH-1];
     reg [8:0]  fifo_wptr, fifo_rptr;
     reg [9:0]  fifo_cnt;
     wire       fifo_wr    = src_en && (fifo_cnt < FIFO_DEPTH);
@@ -45,8 +46,10 @@ module scaler #(
     reg [23:0] fifo_dout_r;      // fifo 同步读数据
 
     // ---- 行缓存 ----
-    reg [23:0] line_buf [0:SRC_MAX-1];
-    reg [23:0] lbuf_dout_r;      // line_buf 同步读数据
+    // 1024x24 显式例化 BRAM9K 原语：综合器对该深度拒绝 block_ram 推断
+    // （SYN-1027 仍推成 DRAM 吃掉 ~3k LUT，导致 x7y2 布线冲突）
+    // NOREG 模式读延迟 1 拍，与原 "lbuf_dout_r <= line_buf[rd_x]" 时序完全一致
+    wire [23:0] lbuf_dout_r;     // BRAM B 口同步读数据（地址给出后下一拍有效）
 
     localparam S_IDLE      = 3'd0;
     localparam S_READ_ADDR = 3'd1;
@@ -93,12 +96,22 @@ module scaler #(
             fifo_dout_r <= fifo_mem[fifo_rptr];
     end
 
-    // ---- line_buf 同步读 ----
-    always @(posedge clk or posedge rst) begin
-        if (rst) lbuf_dout_r <= 24'd0;
-        else if (state == S_OUT_ADDR)
-            lbuf_dout_r <= line_buf[rd_x];
-    end
+    // ---- line_buf BRAM 例化（A 口写 / B 口读，单时钟伪双口）----
+    // 写：S_READ_DATA 状态每拍写入 fifo_dout_r；读：S_OUT_ADDR 拍给出 rd_x，
+    // 下一拍（S_OUT_DATA）dob 有效，时序与原同步读完全一致
+    EG_LOGIC_BRAM #(
+        .DATA_WIDTH_A(24), .ADDR_WIDTH_A(10),
+        .DATA_WIDTH_B(24), .ADDR_WIDTH_B(10),
+        .MODE("DP"), .REGMODE_A("NOREG"), .REGMODE_B("NOREG"),
+        .WRITEMODE_A("NORMAL"), .WRITEMODE_B("NORMAL"),
+        .RESETMODE("SYNC"), .IMPLEMENT("9K")
+    ) u_line_buf (
+        .dia(fifo_dout_r), .addra(wr_x[9:0]), .cea(1'b1), .ocea(1'b1),
+        .clka(clk), .wea(state == S_READ_DATA), .rsta(1'b0), .bea(1'b1),
+        .dib(24'd0), .addrb(rd_x[9:0]), .ceb(1'b1), .oceb(1'b1),
+        .clkb(clk), .web(1'b0), .rstb(1'b0), .beb(1'b1),
+        .doa(), .dob(lbuf_dout_r)
+    );
 
     // ---- FIFO 读指针 + 计数 ----
     always @(posedge clk or posedge rst) begin
@@ -150,8 +163,7 @@ module scaler #(
                         state <= S_READ_DATA;
                 end
                 S_READ_DATA: begin
-                    // 数据有效：写 line_buf
-                    line_buf[wr_x] <= fifo_dout_r;
+                    // 数据有效：写 line_buf（BRAM A 口 wea = state==S_READ_DATA 自动完成）
                     wr_x <= wr_x + 11'd1;
                     if (wr_x == src_w_l - 11'd1) begin
                         wr_x <= 11'd0;
