@@ -79,7 +79,29 @@ reg App_wr_en_r;
 reg App_wr_en_d0;
 
 wire into_burst;
-assign into_burst = (((write_len_latch <= (rdusedw + write_cnt))||rdusedw > BURST_SIZE) && ~App_rd_busy);//当rd在突发时不会进入burst
+// 剩余帧长预先寄存：原式 write_len_latch <= rdusedw + write_cnt 把 21bit
+// 加法/比较全串在 rdusedw（gray 同步指针减法）之后，125MHz 下 8 级逻辑
+// SWNS -0.171ns。改为寄存器预存 rem_len，检查拍只剩 10bit 比较。
+// 等价性：write_len >= rdusedw + write_cnt  <=>  rem_len <= rdusedw
+wire [ADDR_BITS - 1:0] rem_len_w = write_len_latch - write_cnt;
+wire                   rem_fits_w = (rem_len_w <= 10'd1023);
+reg  [ADDR_BITS - 1:0] rem_len;
+reg                    rem_fits;
+always@(posedge mem_clk or posedge rst)
+begin
+	if(rst == 1'b1)
+	begin
+		rem_len  <= ZERO[ADDR_BITS - 1:0];
+		rem_fits <= 1'b0;
+	end
+	else
+	begin
+		rem_len  <= rem_len_w;
+		rem_fits <= rem_fits_w;
+	end
+end
+
+assign into_burst = ((rem_fits && (rdusedw >= rem_len[9:0]))||rdusedw > BURST_SIZE) && ~App_rd_busy;//当rd在突发时不会进入burst
 
 assign App_wr_addr = {App_wr_addr_r[ADDR_BITS - 1:0]};
 //assign O_wr_busy = (state != S_IDLE || (S_IDLE && write_req_d2));

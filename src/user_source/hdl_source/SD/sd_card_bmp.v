@@ -13,6 +13,9 @@ module sd_card_bmp #(
     input  [15:0]               bmp_height,
     output reg                  display_valid,
     output      [3:0]           state_code,
+    output      [2:0]           img_count,
+    output                      sd_ready,
+    output                      scan_done_o,
 
     input                       write_finish_toggle,
     output reg [1:0]            write_buf_idx,
@@ -142,6 +145,9 @@ assign next_from_current = next_index_limited(next_base, img_found_count);
 assign write_finish_pulse = wrfin_tgl_sync[2] ^ wrfin_tgl_sync[1];
 assign fade_swap_edge      = fade_swap_sync[2] ^ fade_swap_sync[1];
 assign state_code = state_code_i;
+assign img_count  = img_found_count;
+assign sd_ready   = sd_init_done;
+assign scan_done_o = scan_done;
 
 key_press_debounce #(
     .CLK_FREQ_HZ (CLK_FREQ_HZ),
@@ -169,6 +175,18 @@ always @(posedge clk or posedge rst) begin
         wav_pause_sync <= {wav_pause_sync[0], wav_pause};
 end
 assign wav_pause_s = wav_pause_sync[1];
+
+// write_req_ack 由 ext_mem_clk 域产生，bmp_read 在 sd_card_clk 域直接采样
+// 属于跨域握手。ack 在 write_req 撤销前一直保持高，2 级同步后使用，
+// 既消除亚稳态采样风险，也让 ext_mem↔sd 域可按异步组收敛。
+reg  [1:0] wr_ack_sync;
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        wr_ack_sync <= 2'b00;
+    else
+        wr_ack_sync <= {wr_ack_sync[0], write_req_ack};
+end
+wire write_req_ack_s = wr_ack_sync[1];
 
 // ---------------------------------------------------------------------------
 // SD 总线仲裁：bmp_read 与 sd_card_wav 共享 sd_card_top
@@ -526,7 +544,7 @@ bmp_read bmp_read_m0(
     .bmp_width              (bmp_width),
     .bmp_height             (bmp_height),
     .write_req              (write_req),
-    .write_req_ack          (write_req_ack),
+    .write_req_ack          (write_req_ack_s),
     .sd_sec_read            (sd_sec_read),
     .sd_sec_read_addr       (sd_sec_read_addr),
     .sd_sec_read_data       (sd_sec_read_data),

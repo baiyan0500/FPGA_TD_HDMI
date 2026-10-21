@@ -63,6 +63,8 @@ reg [31:0] scan_sector;
 reg [31:0] load_sector_latched;
 reg [31:0] bmp_len_cnt;
 reg [1:0]  bmp_byte_idx;
+reg [12:0] row_bytes;          // 当前行内偏移（含行尾 4 字节对齐填充）
+reg [10:0] pix_row;            // 已完成的像素行数
 
 // RIFF/WAVE 头锁存（扫描期识别 WAV 文件）
 reg [7:0]  riff_id0, riff_id1, riff_id2, riff_id3;
@@ -88,6 +90,36 @@ assign header_match = (header_0 == "B") &&
                       (header_1 == "M") &&
                       (bit_count    == 16'd24) &&
                       (compression  == 32'd0);
+// 只接受自底向上、宽度 ≤1024（scaler 行缓存深度）、高度 ≤2047（11bit）
+// 的 24bit 未压缩 BMP；负高度=自顶向下，当前像素流按自底向上处理，直接拒绝
+wire [12:0] row_pix_bytes_w = {1'b0, width[10:0]} * 13'd3;
+wire [12:0] row_stride_w    = (row_pix_bytes_w + 13'd3) & 13'h1FFC;
+// 行宽/行跨距预先寄存：width 在头解析后恒定，若让乘法器+加法器直接驱动
+// 行计数使能与数据有效，100MHz 下时序为 -0.083ns（MULT18 3.5ns + 进位链）
+reg  [12:0] row_pix_bytes;
+reg  [12:0] row_stride;
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        row_pix_bytes <= 13'd0;
+        row_stride    <= 13'd0;
+    end else begin
+        row_pix_bytes <= row_pix_bytes_w;
+        row_stride    <= row_stride_w;
+    end
+end
+wire size_ok = (width  != 32'd0)    && (width  <= 32'd1024) &&
+               (height != 32'd0)    && (height <= 32'd2047) &&
+               (file_len > pixel_offset);
+wire header_ok = header_match && size_ok;
+// 判定结果打一拍：read_end 拍只剩寄存器输出，避免新增 32bit 比较器
+// 直驱扫描地址/状态机（100MHz 关键路径）
+reg  header_ok_r;
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        header_ok_r <= 1'b0;
+    else
+        header_ok_r <= header_ok;
+end
 assign wav_match = (riff_id0 == "R") && (riff_id1 == "I") &&
                    (riff_id2 == "F") && (riff_id3 == "F") &&
                    (wave_id0 == "W") && (wave_id1 == "A") &&
@@ -96,7 +128,9 @@ assign src_width  = width[15:0];
 assign src_height = height[15:0];
 assign bmp_data_valid = (sd_sec_read_data_valid == 1'b1) &&
                         (bmp_len_cnt >= pixel_offset) &&
-                        (bmp_len_cnt <  file_len);
+                        (bmp_len_cnt <  file_len) &&
+                        (row_bytes < row_pix_bytes) &&
+                        (pix_row < height[10:0]);
 assign next_scan_sector_if_match = scan_sector + file_sector_count_q;
 assign next_scan_sector_if_miss  = scan_sector + 32'd1;
 // RIFF size = 文件长度 - 8，占 (riff_size + 8 + 511) >> 9 个扇区
@@ -228,6 +262,28 @@ end
 
 always @(posedge clk or posedge rst) begin
     if (rst) begin
+        row_bytes <= 13'd0;
+        pix_row   <= 11'd0;
+    end else if (state == ST_LOAD_DATA) begin
+        // 数据区每个字节都推进行内偏移（含填充字节），像素有效窗口由
+        // bmp_data_valid 的 row_bytes < row_pix_bytes 限定
+        if (sd_sec_read_data_valid && (bmp_len_cnt >= pixel_offset) &&
+            (pix_row < height[10:0])) begin
+            if (row_bytes + 13'd1 >= row_stride) begin
+                row_bytes <= 13'd0;
+                pix_row   <= pix_row + 11'd1;
+            end else begin
+                row_bytes <= row_bytes + 13'd1;
+            end
+        end
+    end else begin
+        row_bytes <= 13'd0;
+        pix_row   <= 11'd0;
+    end
+end
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
         bmp_byte_idx <= 2'd0;
     end else if (state == ST_LOAD_DATA) begin
         if (bmp_data_valid)
@@ -337,7 +393,7 @@ always @(posedge clk or posedge rst) begin
                 if (sd_sec_read_end) begin
                     sd_sec_read <= 1'b0;
 
-                    if (header_match) begin
+                    if (header_ok_r) begin
                         scan_found_valid  <= 1'b1;
                         scan_found_sector <= scan_sector;
                         scan_found_total  <= scan_found_total + 3'd1;
@@ -391,7 +447,7 @@ always @(posedge clk or posedge rst) begin
 
                 if (sd_sec_read_end) begin
                     sd_sec_read <= 1'b0;
-                    if (header_match) begin
+                    if (header_ok_r) begin
                         write_req        <= 1'b1;
                         sd_sec_read_addr <= load_sector_latched;
                         state            <= ST_LOAD_WAIT;
@@ -418,7 +474,9 @@ always @(posedge clk or posedge rst) begin
                 end
 
                 if (sd_sec_read_end) begin
-                    if (bmp_len_cnt >= file_len) begin
+                    // 高度行已全部送完即停（文件尾部可能还有填充/附加数据）；
+                    // 截断文件则由 bmp_len_cnt >= file_len 兜底，交给装载超时恢复
+                    if ((pix_row >= height[10:0]) || (bmp_len_cnt >= file_len)) begin
                         state <= ST_IDLE;
                     end else begin
                         sd_sec_read_addr <= sd_sec_read_addr + 32'd1;

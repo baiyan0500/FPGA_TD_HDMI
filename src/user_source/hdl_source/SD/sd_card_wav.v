@@ -138,6 +138,16 @@ wire        fmt_ok = fmt_seen && data_seen && wave_ok &&
                     ((fmt_ch == 16'd1) || (fmt_ch == 16'd2)) &&
                     (rate_idx != 4'd8) && (data_size != 32'd0);
 
+// fmt_ok 打一拍：头解析结束后参数已稳定，W_ARM 用寄存值决策，
+// 避免 32bit data_size 比较器串入 state/cur_sector 使能（SWNS -0.028ns）
+reg fmt_ok_r;
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        fmt_ok_r <= 1'b0;
+    else
+        fmt_ok_r <= fmt_ok;
+end
+
 // 总线请求：头解析或播放补水
 // 阈值 = 停止线(1408) - 4 个扇区余量：grant 往返 + 在途最多 1 个扇区(256 字)，
 // 保证 FIFO 最多到 ~1670 字，远离 2048 深度上限，杜绝满判丢字
@@ -297,7 +307,7 @@ always @(posedge clk or posedge rst) begin
                     o_stereo          <= (fmt_ch == 16'd2);
                     data_start_sector <= i_wav_start_sector + (data_off >> 9);
                 end else if (arm_cnt == 4'd15) begin
-                    if (fmt_ok) begin
+                    if (fmt_ok_r) begin
                         cur_sector   <= i_wav_start_sector + (data_off >> 9);
                         byte_pos     <= 32'd0;
                         in_data_zone <= 1'b1;    // data_size != 0（fmt_ok 已保证）
@@ -321,7 +331,9 @@ always @(posedge clk or posedge rst) begin
                     // sd_card_sec_read_write 在 read_end 的下一拍(S_WAIT_READ_WRITE)
                     // 就锁存 sd_sec_read_addr；必须在本拍把地址推到下一扇区，
                     // 否则下一拍锁到的是刚读完的旧地址 → 每个扇区被读两遍(周期性突突声)
-                    if (byte_pos >= data_size) begin
+                    // !in_data_zone 等价于 byte_pos >= data_size，避免 32bit
+                    // 比较器串进 read_end 分支（SWNS -0.028ns）
+                    if (!in_data_zone) begin
                         cur_sector   <= data_start_sector;   // 循环回 data 起点
                         sd_sec_addr  <= data_start_sector;
                         byte_pos     <= 32'd0;

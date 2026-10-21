@@ -62,13 +62,17 @@ set_clock_groups -exclusive \
 #    2 级同步器或"稳定后再用"协议保护。set_clock_groups 在 TD 6.2
 #    的时序报告中未见生效，改用显式 false path。
 # ------------------------------------------------------------
-set_false_path -from [get_clocks {audio_mclk}] -to [get_clocks {video_clk hdmi_5x_clk sd_card_clk ext_mem_clk}]
-set_false_path -from [get_clocks {video_clk hdmi_5x_clk sd_card_clk ext_mem_clk}] -to [get_clocks {audio_mclk}]
+#    clk(50MHz) 必须包含在内：rst_all 由 clk 域产生，扇出到 audio_mclk
+#    域全部寄存器的异步复位端；若只约束其他时钟，这部分会被当普通数据
+#    路径分析（246 条端点 SWNS -2.188ns），实际是异步复位，无需时序收敛。
+set_false_path -from [get_clocks {audio_mclk}] -to [get_clocks {clk video_clk hdmi_5x_clk sd_card_clk ext_mem_clk}]
+set_false_path -from [get_clocks {clk video_clk hdmi_5x_clk sd_card_clk ext_mem_clk}] -to [get_clocks {audio_mclk}]
 
 # ------------------------------------------------------------
-# 5.1 display_valid 同步器首级（100MHz 准静态电平 → video_clk 2 级同步）
+# 5.1 display_valid 同步器：sd_card_clk → video_clk 的 2 级同步首级
+#     已由 5.3 的 video_clk ↔ sd_card_clk 时钟对 false path 覆盖，
+#     无需再用 get_regs（TD 在 read_adc 阶段解析不到寄存器，命令会失败）
 # ------------------------------------------------------------
-set_false_path -to [get_regs -nowarn {*/display_valid_s1*}]
 
 # ------------------------------------------------------------
 # 5.2 SDRAM 源同步 pad 接口（ext_mem_clk ↔ SDRAM 输出时钟 clkc[2]）
@@ -91,12 +95,16 @@ set_false_path -from [get_clocks {video_clk hdmi_5x_clk}] -to [get_clocks {sd_ca
 set_false_path -from [get_clocks {sd_card_clk ext_mem_clk clk}] -to [get_clocks {video_clk hdmi_5x_clk}]
 
 # ------------------------------------------------------------
-# 5.4 fifo_aclr（ext_mem 域帧 FIFO 清零电平）跨 sys_pll 同步域的
-#     全部 fanout（sd_init_done / bmp_read write_req 等）：准静态
-#     慢电平，上电后不再翻转，豁免 ext_mem_clk→sd_card_clk 间的
-#     布线长路径（SWNS -1.283ns）
+# 5.4 sd_card_clk ↔ ext_mem_clk：同出 sys_pll，但两者之间没有单周期
+#     数据通路，全部交互均为异步 FIFO（gray 指针同步）、write_req 电平
+#     握手（ext 域 3 级同步）与 write_req_ack（sd 域 2 级同步）。
+#     原先用 get_regs 约束 */fifo_aclr_reg* 在 read_adc 阶段无法解析
+#     （命令 CRITICAL-WARNING 失败），残留 ext_mem→sd SWNS -1.006ns。
+#     改为异步时钟组，彻底消除这类跨域伪路径。
 # ------------------------------------------------------------
-set_false_path -from [get_regs -nowarn {*/fifo_aclr_reg*}]
+set_clock_groups -asynchronous \
+    -group [get_clocks {sd_card_clk}] \
+    -group [get_clocks {ext_mem_clk}]
 
 # ------------------------------------------------------------
 # 6. 可选：如果你的 frame_read_write 内部异步 FIFO 已经完全处理好了跨域，
