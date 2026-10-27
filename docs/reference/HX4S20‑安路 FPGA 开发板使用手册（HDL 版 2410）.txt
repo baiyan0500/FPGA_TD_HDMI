@@ -1,0 +1,346 @@
+# HX4S20‑安路FPGA开发板使用手册（HDL版2410）
+> 出品：杭州康芯电子有限公司 官网：WWW.KX‑SOC.COM 2025‑04
+
+## 开发板使用注意事项
+1. USB口插拔时，首先关闭电源开关，轻轻插拔，并且不要频繁插拔，以免造成接口损坏！
+2. 开发板不用时，要关闭电源！
+3. 需外接设备和连线时，首先关闭电源，确保外设接插正确，再打开电源！
+4. 开发板上的裸露的金属针、孔等，不要随意用手触摸，以免静电导致芯片烧坏和污迹粘上氧化！
+5. 开发板上的器件不要随意卸装，以免装配失误导致开发板故障！
+6. 开发板发生故障、水迹、异常或无电时，请立即切断电源！
+7. 平时开发板不用时，及时收纳，以免落入灰尘，引起故障和寿命；平时准备一个吹尘器，板表面或很久没有使用时，清理灰尘！
+8. 开发板应存放于干燥地方，以免潮湿，再开机时引起故障！
+
+## 目录
+一、开发板特色
+二、开发板功能及构成
+①FPGA
+②四组LED发光管
+③40芯GPIO扩展口J2
+④HDMI接口A
+⑤电源开关
+⑥USB‑JTAG
+ (1)开发板供电系统
+ (2) USB‑JTAG编程口
+⑦USB转UART
+⑧HDMI接口B
+⑨VGA接口
+⑩40芯GPIO扩展口J1
+⑪数码管
+⑫8组双色LED发光管
+⑬SPI FLASH W25Q64
+⑭蜂鸣器
+⑮乒乓开关
+⑯4组按键
+⑰TF卡槽
+⑱以太网接口
+⑲50M时钟源
+⑳固化FLASH W25Q16
+
+## 一、开发板特色
+1. HX4S20板核心芯片采用了安路的EG4S系列；
+2. 采用板载USB‑JTAG，USB供电：5V、3.3V、2.5V、1.2V；
+3. 该板含有基础学习的资源，4按键、4开关、8个数码管、8双色LED、4个独立LED；
+4. USB转UART、TF卡、HDMI输入输出口，VGA，千兆网口、蜂鸣器；
+5. SPI FLASH 25Q64/16；
+6. 标配了2组40芯IO扩展口，提供5V、3.3V电源，每组36个IO口（即18对差分IO），扩展接口兼容市场上大多数扩展板。
+
+## 二、开发板构成及功能介绍
+开发板实物标识：
+|序号|模块名称|序号|模块名称|
+| ---- | ---- | ---- | ---- |
+|①|FPGA：安路ED4系列EG4S20BG256|⑪|8组数码管|
+|②|4组LED|⑫|8组双色LED发光管|
+|③|40芯GPIO扩展口JP2|⑬|SPI FLASH 25Q64|
+|④|HDMI A口|⑭|蜂鸣器|
+|⑤|电源开关|⑮|6组乒乓开关|
+|⑥|USB‑JTAG|⑯|5组按键|
+|⑦|USB‑UART|⑰|TF卡槽(背)|
+|⑧|HDMI B口|⑱|千兆网口|
+|⑨|VGA接口|⑲|50M时钟源|
+|⑩|40芯GPIO扩展口JP1|⑳|固化FLASH|
+
+### ① FPGA
+国产FPGA安路：EG4系列：**EG4S20BG256**
+LUTs：19600，RAM：156.8K，BRAMb：1008K，DDR/SDRAM：2M*32。新一代产品，内部资源丰富，可以很好的替代XILINX和ALTERA系列FPGA。此型号为BGA封装，256个引脚。
+> BGA封装引脚命名规则：引脚名称由字母+数字的形式，比如H4，J13等。
+
+#### EG4S20资源简表
+|参数|数值|
+| ---- | ---- |
+|Number of FFs|19600|
+|RAM位|156800|
+|Number of ERAM (9k)|64|
+|Number of ERAM (32k)|16|
+|M18x18乘法器|29|
+|Total Configuration SRAM|4988928|
+|PLL|4|
+|Low‑skew GCLK|16|
+|EM SDRAM|2Mx32bits|
+|User IO Banks|8|
+
+### ② 4组LED发光管
+开发板板载了4个LED发光管(LED1~LED4)，LED低电平点亮。
+
+**4个独立LED引脚分配**
+|信号名称|FPGA引脚|信号名称|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|LED1|A4|LED2|A3|
+|LED3|C10|LED4|B12|
+
+> 原理图说明：4路信号经过1K排阻，接LED阳极，LED阴极共地。输出低电平，LED点亮。
+
+### ③ 40芯GPIO扩展口J2
+- 40芯：5V电源1路，3.3V电源1路，地2路，IO口36路（18对差分）
+- IO电平3.3V，**禁止直接接5V设备，如需接5V外设必须加电平转换芯片**
+- PCB走线差分等长，方便高速扩展模块
+- 实物缺口方向：J2的1脚在正方向右下为第一脚。
+
+**J2 扩展口引脚分配表**
+|脚位号与信号名|FPGA引脚|脚位号与信号名|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|1(GPIOB_0)|P4|2(GPIOB_1)|N4|
+|3(GPIOB_2)|N3|4(GPIOB_3)|M5|
+|5(GPIOB_4)|M3|6(GPIOB_5)|M4|
+|7(GPIOB_6)|L3|8(GPIOB_7)|J3|
+|9(GPIOB_8)|J4|10(GPIOB_9)|H4|
+|11|VCC5V|12|GND|
+|13(GPIOB_10)|N1|14(GPIOB_11)|M2|
+|15(GPIOB_12)|M1|16(GPIOB_13)|L1|
+|17(GPIOB_14)|H2|18(GPIOB_15)|H1|
+|19(GPIOB_16)|G1|20(GPIOB_17)|G3|
+|21(GPIOB_18)|L4|22(GPIOB_19)|L5|
+|23(GPIOB_20)|K6|24(GPIOB_21)|H3|
+|25(GPIOB_22)|H5|26(GPIOB_23)|F3|
+|27(GPIOB_24)|E2|28(GPIOB_25)|J11|
+|29|3.3V|30|GND|
+|31(GPIOB_26)|J12|32(GPIOB_27)|K11|
+|33(GPIOB_28)|K14|34(GPIOB_29)|L12|
+|35(GPIOB_30)|M12|36(GPIOB_31)|M11|
+|37(GPIOB_32)|N12|38(GPIOB_33)|P14|
+|39(GPIOB_34)|P12|40(GPIOB_35)|R12|
+
+### ④ HDMI接口A
+直连FPGA，可做输入或输出，使用FPGA内部IP核处理HDMI信号。
+
+**HDMI‑A引脚表**
+|信号名称|FPGA引脚|信号名称|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|HDMIA_D2_P|B3|HDMIA_D0_P|F5|
+|HDMIA_D2_N|D3|HDMIA_D0_N|F4|
+|HDMIA_D1_P|E3|HDMIA_SCL|P1|
+|HDMIA_D1_N|E4|HDMIA_SDA|R1|
+|HDMIA_HPD|K2|HDMIA_CLK_N|J1|
+|HDMIA_CEC|K3|HDMIA_CLK_P|K1|
+
+### ⑤ 电源开关
+USB‑JTAG输入5V后经过总电源开关SW，控制开发板整机供电，带保险丝F1；有红色电源指示灯LED14，串联1K电阻。
+
+### ⑥ USB‑JTAG
+此USB接口有二个作用：(1)开发板供电口；(2)FPGA编程口。
+
+#### (1)开发板供电系统
+USB输入5V进入电源管理系统，产生多路电压：+5V、+3.3V、+2.5V、+1.2V。
+- FPGA：3.3V、1.2V
+- Ethernet PHY：3.3V、2.5V
+- GPIO,HDMI：3.3V、5V
+- 按键、LED、数码管、开关、FLASH：3.3V、5V
+
+#### (2)USB‑JTAG编程口
+板载Anlogic USB Cable，USB‑B接口，接电脑USB。
+- JTAG模式下载.bit到FPGA运行；
+- 可将.bin文件烧录至FLASH，实现掉电保存，上电自动加载。
+- JTAG信号：TCK、TDO、TMS、TDI直接连接FPGA引脚。
+
+**JTAG接口引脚表**
+|信号名称|FPGA引脚|信号名称|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|FPGA_TCK|C14|FPGA_TDI|C12|
+|FPGA_TMS|A15|FPGA_TDO|E14|
+
+### ⑦ USB转UART
+采用CH340G芯片，Type‑C接口；实现USB转串口，也可供电。
+
+**串口引脚分配**
+|引脚名称|FPGA引脚|
+| ---- | ---- |
+|RXD|F12|
+|TXD|D12|
+
+### ⑧ HDMI接口B
+原理同HDMI‑A，支持输入输出，可A口输入，B口输出。
+
+**HDMI‑B引脚表**
+|信号名称|FPGA引脚|信号名称|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|HDMIB_D2_P|E1|HDMIB_D0_P|G5|
+|HDMIB_D2_N|D1|HDMIB_D0_N|G6|
+|HDMIB_D1_P|F1|HDMIB_SCL|P2|
+|HDMIB_D1_N|F2|HDMIB_SDA|R2|
+|HDMIB_HPD|J6|HDMIB_CLK_P|K5|
+
+### ⑨ VGA接口
+VGA共12根信号连接FPGA，RGB各4位，行同步HS、场同步VS。
+
+**VGA引脚分配**
+|信号名称|FPGA引脚|信号名称|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|VGA_HS|E7|VGA_VS|F7|
+|VGAD0|F6|VGAD1|E6|
+|VGAD2|D6|VGAD3|D5|
+|VGAD4|T5|VGAD5|P5|
+|VGAD6|N5|VGAD7|N6|
+|VGAD8|R5|VGAD9|L7|
+|VGAD10|L8|VGAD11|E13|
+
+### ⑩ 40芯GPIO扩展口J1
+同样40芯扩展口；实物缺口方向：J1的1脚在正方向左上为第一脚。
+
+**J1扩展口引脚分配表**
+|脚位号与信号名|FPGA引脚|脚位号与信号名|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|1(GPIOA_0)|D14|2(GPIOA_1)|G11|
+|3(GPIOA_2)|G12|4(GPIOA_3)|F13|
+|5(GPIOA_4)|H13|6(GPIOA_5)|H14|
+|7(GPIOA_6)|J14|8(GPIOA_7)|J13|
+|9(GPIOA_8)|K12|10(GPIOA_9)|L14|
+|11|VCC5V|12|GND|
+|13(GPIOA_10)|M14|14(GPIOA_11)|P11|
+|15(GPIOA_12)|L10|16(GPIOA_13)|M10|
+|17(GPIOA_14)|D16|18(GPIOA_15)|E15|
+|19(GPIOA_16)|F14|20(GPIOA_17)|F15|
+|21(GPIOA_18)|G16|22(GPIOA_19)|G14|
+|23(GPIOA_20)|K15|24(GPIOA_21)|J16|
+|25(GPIOA_22)|H15|26(GPIOA_23)|H16|
+|27(GPIOA_24)|K16|28(GPIOA_25)|M16|
+|29|3.3V|30|GND|
+|31(GPIOA_26)|M15|32(GPIOA_27)|L16|
+|33(GPIOA_28)|N16|34(GPIOA_29)|N14|
+|35(GPIOA_30)|P16|36(GPIOA_31)|P15|
+|37(GPIOA_32)|R16|38(GPIOA_33)|R15|
+|39(GPIOA_34)|T15|40(GPIOA_35)|R14|
+
+### ⑪ 数码管
+- 器件：2组4位一体**共阳极八段数码管（带小数点DP）**；
+- 共阳逻辑：段脚输出**低电平点亮段**；位选SEL高电平选通对应数码管；
+- 动态扫描：8个数码管段全部并联，SEL分时选通；扫描频率>50Hz消除人眼看到的闪烁；
+- **引脚复用**：数码管16个引脚与8组双色LED完全复用。SW6拨码开关选择功能：拨上=数码管，拨下=双色LED。
+- DIG[0..7]：a‑g、dp段信号；SEL[0..7]：8个位选信号。
+
+### ⑫ 8组双色LED发光管
+8个双色LED，每个包含红、绿两个灯，等效16个LED。FPGA输出逻辑1点亮LED，输出逻辑0熄灭。引脚与数码管复用，由SW6选择。
+
+**双色LED / 数码管复用引脚分配**
+|双色LED引脚名称|数码管引脚名称|FPGA引脚|
+| ---- | ---- | ---- |
+|LED6红|DIG0(a段)|C15|
+|LED6绿|SEL0(第1个数码管)|F16|
+|LED7红|DIG1(b段)|C16|
+|LED7绿|SEL1(第2个数码管)|E16|
+|LED8红|DIG2(c段)|B6|
+|LED8绿|SEL2(第3个数码管)|E12|
+|LED9红|DIG3(d段)|A5|
+|LED9绿|SEL3(第4个数码管)|E10|
+|LED10红|DIG4(e段)|B5|
+|LED10绿|SEL4(第5个数码管)|C13|
+|LED11红|DIG5(f段)|A8|
+|LED11绿|SEL5(第6个数码管)|F10|
+|‑|DIG6(g段)|A7|
+|‑|SEL6(第7个数码管)|E11|
+|‑|DIG7(h/dp段)|A6|
+|‑|SEL7(第8个数码管)|D11|
+
+### ⑬ SPI FLASH W25Q64
+64Mbit SPI FLASH，擦写周期10万次，保存20年；电压2.7‑3.6V；支持SPI、双SPI、四SPI，最高时钟80MHz。
+
+**W25Q64引脚分配**
+|W25Q64引脚名称|FPGA引脚|W25Q64引脚名称|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|FLASH_CS|P8|FLASH_HOLD|R9|
+|FLASH_SDO|N8|FLASH_SCLK|M9|
+|FLASH_WP|P9|FLASH_SDI|P7|
+
+### ⑭ 蜂鸣器
+PNP三极管驱动：BUZZER为**低电平三极管导通，蜂鸣器鸣叫；高电平截止不响**。
+SW5乒乓开关：拨上断开蜂鸣器，拨下接通。
+
+**蜂鸣器引脚分配**
+|引脚名称|FPGA引脚|
+| ---- | ---- |
+|BUZZER|H11|
+
+### ⑮ 乒乓开关（拨码开关）
+一共6路乒乓开关：
+- SW1‑SW4：输入FPGA IO，拨上逻辑1，拨下逻辑0；
+- SW5：蜂鸣器使能开关；
+- SW6：数码管/双色LED复用选择开关。
+
+**SW1‑SW4引脚**
+|开关信号|FPGA引脚|开关信号|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|SW1|C8|SW2|C7|
+|SW3|C6|SW4|C5|
+
+### ⑯ 4组独立按键
+KEY1‑KEY4；按键**按下输出低电平，松开上拉为高电平**。
+
+**按键引脚分配**
+|信号名称|FPGA引脚|信号名称|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|KEY1|A2|KEY2|B2|
+|KEY3|B1|KEY4|C1|
+
+### ⑰ TF卡槽
+TF卡槽在开发板背面；支持SD模式（兼容SPI模式）。
+
+**TF卡引脚分配（SD模式）**
+|TF信号名称|FPGA引脚|TF信号名称|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|SD_DAT3(CS)|A12|SD_DAT2|A11|
+|SD_DAT1|B15|SD_DAT0(MISO)|B14|
+|SD_CLK|A14|SD_CMD(MOSI)|A13|
+
+> SD模式引脚定义：1‑data2；2‑data3；3‑cmd；4‑vdd；5‑clk；6‑vss；7‑data0；8‑data1。
+
+### ⑱ 以太网接口
+PHY芯片RTL8211E‑VB‑CG，千兆以太网，HR911130A网口座。
+
+**以太网接口FPGA引脚**
+|信号名称|FPGA引脚|信号名称|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|MDC0|L13|MDIO0|M13|
+|RXCTI/PHY_AD|T13|TXCLK|T12|
+|RXD0|P6|TXD0|T4|
+|RXD1|M6|TXD1|T6|
+|RXD2|T9|TXD2|M7|
+|RXD3|N9|TXD3|T8|
+|TXCTL|T7|RXC|T14|
+
+### ⑲ 50M时钟源
+有源晶振输出全局时钟，连接FPGA全局时钟管脚，可通过FPGA内部PLL做倍频、分频。
+
+**时钟引脚分配**
+|时钟信号|FPGA引脚|
+| ---- | ---- |
+|CLK|R7|
+
+### ⑳ 固化FLASH W25Q16
+FPGA上电配置SPI FLASH，W25Q16，用于存储FPGA配置镜像；上电FPGA自动读取该FLASH完成配置。
+
+**固化FLASH W25Q16引脚（部分）**
+|引脚名|FPGA引脚|引脚名|FPGA引脚|
+| ---- | ---- | ---- | ---- |
+|MSPI_CS|T3|MSPI_MOSI|T10|
+
+> 手册说明：固化FLASH其余引脚用户设计无需手动约束。
+
+---
+
+## 文档底部信息
+杭州康芯电子有限公司
+地址：杭州市莫干山路1418‑36号2幢6楼
+网址：WWW.KX‑SOC.COM
+电话：0571‑88914587
+邮编：310010
+版本时间：2025‑04
+

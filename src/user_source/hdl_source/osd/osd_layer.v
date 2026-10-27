@@ -31,7 +31,10 @@ module osd_layer #(
     input  wire        i_display_valid,// 首图已提交（隐藏启动面板）
     input  wire        i_sd_init_done,
     input  wire        i_scan_done,
-    input  wire [2:0]  i_img_count,    // 扫描到的图片数
+    input  wire [4:0]  i_img_count,    // 扫描到的图片数（0~16）
+    input  wire [15:0] i_src_w_bcd,    // 当前显示图源宽 BCD（100MHz 域，配 i_src_tgl）
+    input  wire [15:0] i_src_h_bcd,
+    input  wire        i_src_tgl,
     input  wire        i_auto_play,    // 自动轮播状态
 
     output reg         o_hs,
@@ -55,7 +58,7 @@ module osd_layer #(
     localparam [10:0] BOT_Y       = V_ACTIVE - BAR_H;               // 456
     localparam [10:0] BOT_GLYPH_Y = BOT_Y + (BAR_H - CHAR_H) / 2;   // 460
     localparam [10:0] BOT_X       = 11'd8;
-    localparam [4:0]  BOT_LEN     = 5'd27;
+    localparam [5:0]  BOT_LEN     = 6'd38;          // 源尺寸标注(17) + FPS/状态(21)
 
     // ---- 像素位置跟踪 ----
     reg [10:0] x;
@@ -133,6 +136,56 @@ module osd_layer #(
     end
     wire [6:0] fps_tens_char = 7'h30 + (fps_val / 10);
     wire [6:0] fps_ones_char = 7'h30 + (fps_val % 10);
+
+    // ---- 当前显示图的源尺寸（100MHz 域 BCD + toggle 握手）----
+    // 底栏标注 "1024x577>640x480"；源图本身就是 640x480 时只显示 "640x480"
+    reg  [2:0]  src_tgl_sync;
+    wire        src_tgl_edge = src_tgl_sync[2] ^ src_tgl_sync[1];
+    reg  [15:0] src_w_bcd_q;
+    reg  [15:0] src_h_bcd_q;
+    wire        src_native = (src_w_bcd_q == 16'h0640) && (src_h_bcd_q == 16'h0480);
+    wire        src_known  = (src_w_bcd_q != 16'd0) && (src_h_bcd_q != 16'd0);
+    always @(posedge i_clk or posedge i_rst) begin
+        if (i_rst) begin
+            src_tgl_sync <= 3'd0;
+            src_w_bcd_q  <= 16'h0640;
+            src_h_bcd_q  <= 16'h0480;
+        end else begin
+            src_tgl_sync <= {src_tgl_sync[1:0], i_src_tgl};
+            if (src_tgl_edge) begin
+                src_w_bcd_q <= i_src_w_bcd;
+                src_h_bcd_q <= i_src_h_bcd;
+            end
+        end
+    end
+
+    // 底栏四位 BCD 去前导零：高到低依次判断，直到遇到非零位才显示
+    wire [3:0] src_w3 = src_w_bcd_q[15:12];
+    wire [3:0] src_w2 = src_w_bcd_q[11:8];
+    wire [3:0] src_w1 = src_w_bcd_q[7:4];
+    wire [3:0] src_w0 = src_w_bcd_q[3:0];
+    wire [3:0] src_h3 = src_h_bcd_q[15:12];
+    wire [3:0] src_h2 = src_h_bcd_q[11:8];
+    wire [3:0] src_h1 = src_h_bcd_q[7:4];
+    wire [3:0] src_h0 = src_h_bcd_q[3:0];
+    wire src_w_z3 = (src_w3 == 4'd0);
+    wire src_w_z2 = src_w_z3 && (src_w2 == 4'd0);
+    wire src_w_z1 = src_w_z2 && (src_w1 == 4'd0);
+    wire src_h_z3 = (src_h3 == 4'd0);
+    wire src_h_z2 = src_h_z3 && (src_h2 == 4'd0);
+    wire src_h_z1 = src_h_z2 && (src_h1 == 4'd0);
+    wire [6:0] src_w_c3 = src_w_z3 ? 7'h20 : {3'h3, src_w3};
+    wire [6:0] src_w_c2 = src_w_z2 ? 7'h20 : {3'h3, src_w2};
+    wire [6:0] src_w_c1 = src_w_z1 ? 7'h20 : {3'h3, src_w1};
+    wire [6:0] src_w_c0 = {3'h3, src_w0};
+    wire [6:0] src_h_c3 = src_h_z3 ? 7'h20 : {3'h3, src_h3};
+    wire [6:0] src_h_c2 = src_h_z2 ? 7'h20 : {3'h3, src_h2};
+    wire [6:0] src_h_c1 = src_h_z1 ? 7'h20 : {3'h3, src_h1};
+    wire [6:0] src_h_c0 = {3'h3, src_h0};
+
+    // ---- 图片数两位十进制（0~16）----
+    wire [3:0] img_cnt_tens = i_img_count / 5'd10;
+    wire [3:0] img_cnt_ones = i_img_count % 5'd10;
 
     // ---- 标语锁存（跨域）+ 平滑滚动 ----
     reg [7:0] slogan [0:31];
@@ -239,10 +292,10 @@ module osd_layer #(
         endcase
     end
 
-    // ---- 底部信息栏几何（保持不变）----
+    // ---- 底部信息栏几何 ----
     wire in_bot_bar = (y >= BOT_Y);
     wire [10:0] bot_off = x - BOT_X;
-    wire [4:0]  bot_idx = bot_off[8:4];
+    wire [5:0]  bot_idx = bot_off[9:4];
     wire [2:0]  bot_col = bot_off[3:1];
     wire [10:0] bot_v   = y - BOT_GLYPH_Y;
     wire [2:0]  bot_row = bot_v[3:1];
@@ -252,36 +305,69 @@ module osd_layer #(
 
     reg [6:0] bot_char;
     always @(*) begin
-        case (bot_idx)
-            5'd0:  bot_char = 7'h36;
-            5'd1:  bot_char = 7'h34;
-            5'd2:  bot_char = 7'h30;
-            5'd3:  bot_char = 7'h78;
-            5'd4:  bot_char = 7'h34;
-            5'd5:  bot_char = 7'h38;
-            5'd6:  bot_char = 7'h30;
-            5'd7:  bot_char = 7'h20;
-            5'd8:  bot_char = fps_tens_char;
-            5'd9:  bot_char = fps_ones_char;
-            5'd10: bot_char = 7'h46;
-            5'd11: bot_char = 7'h50;
-            5'd12: bot_char = 7'h53;
-            5'd13: bot_char = 7'h20;
-            5'd14: bot_char = 7'h4D;
-            5'd15: bot_char = 7'h4F;
-            5'd16: bot_char = 7'h44;
-            5'd17: bot_char = 7'h3A;
-            5'd18: bot_char = {3'h3, 2'b00, i_mode};
-            5'd19: bot_char = 7'h20;
-            5'd20: bot_char = 7'h42;
-            5'd21: bot_char = 7'h3A;
-            5'd22: bot_char = {3'h3, 1'b0, i_bright};
-            5'd23: bot_char = 7'h20;
-            5'd24: bot_char = 7'h43;
-            5'd25: bot_char = 7'h3A;
-            5'd26: bot_char = {3'h3, 1'b0, i_contrast};
-            default: bot_char = 7'h20;
-        endcase
+        bot_char = 7'h20;
+        if (bot_idx <= 6'd17) begin
+            // 左段：源尺寸 → 输出尺寸标注
+            if (!src_known) begin
+                bot_char = 7'h20;
+            end else if (src_native) begin
+                case (bot_idx)
+                    6'd0: bot_char = "6";
+                    6'd1: bot_char = "4";
+                    6'd2: bot_char = "0";
+                    6'd3: bot_char = "x";
+                    6'd4: bot_char = "4";
+                    6'd5: bot_char = "8";
+                    6'd6: bot_char = "0";
+                    default: bot_char = 7'h20;
+                endcase
+            end else begin
+                case (bot_idx)
+                    6'd0:  bot_char = src_w_c3;
+                    6'd1:  bot_char = src_w_c2;
+                    6'd2:  bot_char = src_w_c1;
+                    6'd3:  bot_char = src_w_c0;
+                    6'd4:  bot_char = "x";
+                    6'd5:  bot_char = src_h_c3;
+                    6'd6:  bot_char = src_h_c2;
+                    6'd7:  bot_char = src_h_c1;
+                    6'd8:  bot_char = src_h_c0;
+                    6'd9:  bot_char = ">";
+                    6'd10: bot_char = "6";
+                    6'd11: bot_char = "4";
+                    6'd12: bot_char = "0";
+                    6'd13: bot_char = "x";
+                    6'd14: bot_char = "4";
+                    6'd15: bot_char = "8";
+                    6'd16: bot_char = "0";
+                    default: bot_char = 7'h20;
+                endcase
+            end
+        end else begin
+            // 右段：60FPS MOD:0 B:2 C:2（固定从第 18 个字符开始）
+            case (bot_idx)
+                6'd18: bot_char = fps_tens_char;
+                6'd19: bot_char = fps_ones_char;
+                6'd20: bot_char = "F";
+                6'd21: bot_char = "P";
+                6'd22: bot_char = "S";
+                6'd23: bot_char = " ";
+                6'd24: bot_char = "M";
+                6'd25: bot_char = "O";
+                6'd26: bot_char = "D";
+                6'd27: bot_char = ":";
+                6'd28: bot_char = {3'h3, 2'b00, i_mode};
+                6'd29: bot_char = " ";
+                6'd30: bot_char = "B";
+                6'd31: bot_char = ":";
+                6'd32: bot_char = {3'h3, 1'b0, i_bright};
+                6'd33: bot_char = " ";
+                6'd34: bot_char = "C";
+                6'd35: bot_char = ":";
+                6'd36: bot_char = {3'h3, 1'b0, i_contrast};
+                default: bot_char = 7'h20;
+            endcase
+        end
     end
 
     // ======================= 启动界面 =======================
@@ -840,8 +926,8 @@ module osd_layer #(
                         5'd11: stat_char = "M";
                         5'd12: stat_char = "G";
                         5'd13: stat_char = ":";
-                        5'd14: stat_char = {3'h3, 1'b0, i_img_count};
-                        5'd15: stat_char = " ";
+                        5'd14: stat_char = (img_cnt_tens == 4'd0) ? 7'h20 : {3'h3, img_cnt_tens};
+                        5'd15: stat_char = {3'h3, img_cnt_ones};
                         default: stat_char = 7'h20;
                     endcase
                 end
@@ -894,7 +980,7 @@ module osd_layer #(
 
     wire [1:0] boot_sel = (!i_sd_init_done)     ? 2'd0 :
                           (!i_scan_done)        ? 2'd1 :
-                          (i_img_count == 3'd0) ? 2'd3 :
+                          (i_img_count == 5'd0) ? 2'd3 :
                                                   2'd2;
 
     // ---- 左面板：x8..408, y80..392，3px 跑马灯边框 ----
@@ -1101,8 +1187,10 @@ module osd_layer #(
             boot_text_on = 1'b1;
             boot_text_color = 24'hFFFFFF;
         end else if (in_fnd) begin
-            if (fnd_idx == 5'd14)
-                boot_char = {3'h3, 2'b00, i_img_count};
+            if (fnd_idx == 5'd13)
+                boot_char = (img_cnt_tens == 4'd0) ? 7'h20 : {3'h3, img_cnt_tens};
+            else if (fnd_idx == 5'd14)
+                boot_char = {3'h3, img_cnt_ones};
             else
                 boot_char = fixed_char(3'd7, fnd_idx);
             boot_row  = fnd_row;

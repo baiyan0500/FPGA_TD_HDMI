@@ -3,7 +3,7 @@ module sd_card_bmp #(
     parameter integer CLK_FREQ_HZ       = 100_000_000,
     parameter [31:0]  SCAN_START_SECTOR = 32'd0,
     parameter [31:0]  SCAN_MAX_SECTOR   = 32'd131071,
-    parameter [2:0]   SCAN_TARGET_COUNT = 3'd6
+    parameter [4:0]   SCAN_TARGET_COUNT = 5'd16
 )(
     input                       clk,
     input                       rst,
@@ -13,9 +13,15 @@ module sd_card_bmp #(
     input  [15:0]               bmp_height,
     output reg                  display_valid,
     output      [3:0]           state_code,
-    output      [2:0]           img_count,
+    output      [4:0]           img_count,
     output                      sd_ready,
     output                      scan_done_o,
+
+    // 当前显示图的源尺寸（100MHz 域 BCD：{千,百,十,个}，提交新图后更新）
+    // + 更新 toggle（跨域握手，底栏据此标注 "源尺寸>640x480"）
+    output reg  [15:0]          o_src_w_bcd,
+    output reg  [15:0]          o_src_h_bcd,
+    output reg                  o_src_tgl,
 
     input                       write_finish_toggle,
     output reg [1:0]            write_buf_idx,
@@ -66,7 +72,7 @@ wire             bmp_ready;
 wire             scan_done;
 wire             scan_found_valid;
 wire [31:0]      scan_found_sector;
-wire [2:0]       scan_found_total;
+wire [4:0]       scan_found_total;
 
 // ---- WAV 客户端 ----
 wire             wav_found;
@@ -99,16 +105,28 @@ reg              scan_kicked;
 reg              first_image_committed;
 reg              auto_play_en;
 reg [31:0]       auto_cnt;
-reg [2:0]        img_found_count;
-reg [2:0]        img_idx;              // 当前真正显示中的图片编号
-reg [2:0]        load_idx;             // 当前正在写入的图片编号
+reg [4:0]        img_found_count;      // 0..16（比表项多 1，便于判断"表已满"）
+reg [3:0]        img_idx;              // 当前真正显示中的图片编号
+reg [3:0]        load_idx;             // 当前正在写入的图片编号
 reg [1:0]        pending_buf_idx;      // 当前正在写入的目标缓冲区
-reg [31:0]       img_sector0;
-reg [31:0]       img_sector1;
-reg [31:0]       img_sector2;
-reg [31:0]       img_sector3;
-reg [31:0]       img_sector4;
-reg [31:0]       img_sector5;
+// 图片起始扇区表（16 张）。本卡 SCAN_MAX_SECTOR=131071，18bit 足够（256MB 上限），
+// 比 32bit 省 224 个触发器——当前 slice 占用已超 90%
+reg [17:0]       img_sector0;
+reg [17:0]       img_sector1;
+reg [17:0]       img_sector2;
+reg [17:0]       img_sector3;
+reg [17:0]       img_sector4;
+reg [17:0]       img_sector5;
+reg [17:0]       img_sector6;
+reg [17:0]       img_sector7;
+reg [17:0]       img_sector8;
+reg [17:0]       img_sector9;
+reg [17:0]       img_sector10;
+reg [17:0]       img_sector11;
+reg [17:0]       img_sector12;
+reg [17:0]       img_sector13;
+reg [17:0]       img_sector14;
+reg [17:0]       img_sector15;
 reg              next_req_pending;
 reg              load_busy;
 reg [31:0]       load_timeout_cnt;
@@ -122,8 +140,38 @@ reg              swap_pending;         // 正在等待淡出完成（fade_swap �
 reg              img_shown_pulse;      // 切图脉冲（播放计数 +1）
 reg              load_active_seen;     // bmp_read 已真正离开 IDLE（装载确实启动过）
 reg              wr_req_seen;          // 本次装载已发出 write_req（header 匹配过）
-reg [2:0]        fail_idx;             // 最近一次装载失败的图片索引
+reg [3:0]        fail_idx;             // 最近一次装载失败的图片索引
 reg              fail_valid;           // fail_idx 有效：下次切图从它的下一张继续尝试
+
+// WAV 总线授予看门狗：正常一次补水（最多 3 个扇区）约 0.5ms，超过 1.5ms
+// 视为在途标志卡死（sd_sec_read 撤销早于 SD 核采样会丢掉请求），强制收回总线
+reg [17:0]       wav_grant_cnt;
+// bmp 侧同型看门狗：在途扇区超过 1.5ms 仍无 read_end，强制清 bmp_rd_busy，
+// 否则 WAV 因 !bmp_rd_busy 永远拿不到总线，整机卡死在等 1s 装载超时
+reg [17:0]       bmp_busy_cnt;
+
+// 源尺寸二进制 → BCD（double dabble，11 位输入，11 拍完成）
+reg [26:0]       dab_w;                // {BCD[15:0], bin[10:0]}
+reg [26:0]       dab_h;
+reg [3:0]        dab_cnt;
+reg              dab_busy;
+reg              src_commit;           // 提交新图（与 img_shown_pulse 同拍）
+reg [15:0]       src_w_lat;
+reg [15:0]       src_h_lat;
+
+function [3:0] dab_add3;
+    input [3:0] d;
+    begin
+        dab_add3 = (d >= 4'd5) ? (d + 4'd3) : d;
+    end
+endfunction
+
+wire [26:0] dab_w_add = { dab_add3(dab_w[26:23]), dab_add3(dab_w[22:19]),
+                          dab_add3(dab_w[18:15]), dab_add3(dab_w[14:11]), dab_w[10:0] };
+wire [26:0] dab_h_add = { dab_add3(dab_h[26:23]), dab_add3(dab_h[22:19]),
+                          dab_add3(dab_h[18:15]), dab_add3(dab_h[14:11]), dab_h[10:0] };
+wire [26:0] dab_w_nxt = {dab_w_add[25:0], 1'b0};
+wire [26:0] dab_h_nxt = {dab_h_add[25:0], 1'b0};
 
 // 同步 mem_clk 域的 write_finish_toggle
 reg [2:0]        wrfin_tgl_sync;
@@ -134,8 +182,8 @@ reg [2:0]        fade_swap_sync;
 wire             fade_swap_edge;
 
 wire auto_tick;
-wire [2:0] next_base;        // 切图基准：上次失败的图 → 从它继续，否则从当前显示图继续
-wire [2:0] next_from_current;
+wire [3:0] next_base;        // 切图基准：上次失败的图 → 从它继续，否则从当前显示图继续
+wire [3:0] next_from_current;
 
 assign write_en   = scale_wr_en;
 assign write_data = {scale_data[23:16], scale_data[15:8], scale_data[7:0], 8'b0};
@@ -193,18 +241,40 @@ wire write_req_ack_s = wr_ack_sync[1];
 //   · 切换仅在"双方均无在途扇区且无挂起请求"的拍发生（扇区边界）
 //   · want_wav=1 时 bmp_read 被 i_stall 背压，在扇区边界让出总线
 //   · bmp_rd_busy/wav_rd_busy 跟踪在途扇区，保证 read_end 分发回发起方
+//   · wav_grant_cnt / bmp_busy_cnt 看门狗：任一方的在途标志超过 1.5ms
+//     （≈9 个扇区，正常单扇区约 180µs）无进展即视为卡死，强制释放，
+//     避免两方互等（WAV 等 !bmp_rd_busy，bmp 等 want_wav 撤销）形成死锁
 // ---------------------------------------------------------------------------
+wire wav_grant_timeout = (wav_grant_cnt >= 18'd150_000);
+wire bmp_busy_timeout  = (bmp_busy_cnt >= 18'd150_000);
+
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         grant_wav    <= 1'b0;
         bmp_rd_busy  <= 1'b0;
         wav_rd_busy  <= 1'b0;
+        wav_grant_cnt <= 18'd0;
+        bmp_busy_cnt <= 18'd0;
     end else begin
+        // 授予期间无扇区完成就累加（wav_read_end 即"有进展"）
+        if (!grant_wav || wav_read_end)
+            wav_grant_cnt <= 18'd0;
+        else
+            wav_grant_cnt <= wav_grant_cnt + 18'd1;
+
+        // bmp 侧在途无进展计数（背压期间 bmp_rd_busy=0，不计时）
+        if (!bmp_rd_busy || bmp_read_end_g)
+            bmp_busy_cnt <= 18'd0;
+        else
+            bmp_busy_cnt <= bmp_busy_cnt + 18'd1;
+
         // bmp 侧在途跟踪
         if (!grant_wav && !bmp_rd_busy && sd_sec_read)
             bmp_rd_busy <= 1'b1;
         else if (!grant_wav && bmp_read_end_g)
             bmp_rd_busy <= 1'b0;
+        else if (!grant_wav && bmp_busy_timeout)
+            bmp_rd_busy <= 1'b0;    // 卡死：清在途标志，让 WAV 能拿到总线
 
         // wav 侧在途跟踪
         if (grant_wav && !wav_rd_busy && wav_sd_read)
@@ -213,40 +283,53 @@ always @(posedge clk or posedge rst) begin
             wav_rd_busy <= 1'b0;
 
         // 总线授予切换
-        if (!grant_wav && want_wav && !bmp_rd_busy && !sd_sec_read)
-            grant_wav <= 1'b1;
-        else if (grant_wav && !want_wav && !wav_rd_busy && !wav_sd_read)
-            grant_wav <= 1'b0;
+        if (!grant_wav && want_wav && !bmp_rd_busy && !sd_sec_read) begin
+            grant_wav     <= 1'b1;
+            wav_grant_cnt <= 18'd0;
+        end else if (grant_wav && wav_grant_timeout) begin
+            grant_wav     <= 1'b0;      // 卡死：强制收回（下一拍重新竞争）
+            wav_rd_busy   <= 1'b0;
+            wav_grant_cnt <= 18'd0;
+        end else if (grant_wav && !want_wav && !wav_rd_busy && !wav_sd_read) begin
+            grant_wav     <= 1'b0;
+        end
     end
 end
 
-function [2:0] next_index_limited;
-    input [2:0] cur;
-    input [2:0] count;
+function [3:0] next_index_limited;
+    input [3:0] cur;
+    input [4:0] count;
     begin
-        case (count)
-            3'd0: next_index_limited = 3'd0;
-            3'd1: next_index_limited = 3'd0;
-            3'd2: next_index_limited = (cur == 3'd1) ? 3'd0 : (cur + 3'd1);
-            3'd3: next_index_limited = (cur == 3'd2) ? 3'd0 : (cur + 3'd1);
-            3'd4: next_index_limited = (cur == 3'd3) ? 3'd0 : (cur + 3'd1);
-            3'd5: next_index_limited = (cur == 3'd4) ? 3'd0 : (cur + 3'd1);
-            default: next_index_limited = (cur == 3'd5) ? 3'd0 : (cur + 3'd1);
-        endcase
+        if (count == 5'd0)
+            next_index_limited = 4'd0;
+        else if (({1'b0, cur} + 5'd1) >= count)
+            next_index_limited = 4'd0;
+        else
+            next_index_limited = cur + 4'd1;
     end
 endfunction
 
 function [31:0] sector_lut;
-    input [2:0] idx;
+    input [3:0] idx;
     begin
         case (idx)
-            3'd0: sector_lut = img_sector0;
-            3'd1: sector_lut = img_sector1;
-            3'd2: sector_lut = img_sector2;
-            3'd3: sector_lut = img_sector3;
-            3'd4: sector_lut = img_sector4;
-            3'd5: sector_lut = img_sector5;
-            default: sector_lut = img_sector0;
+            4'd0:  sector_lut = {14'd0, img_sector0};
+            4'd1:  sector_lut = {14'd0, img_sector1};
+            4'd2:  sector_lut = {14'd0, img_sector2};
+            4'd3:  sector_lut = {14'd0, img_sector3};
+            4'd4:  sector_lut = {14'd0, img_sector4};
+            4'd5:  sector_lut = {14'd0, img_sector5};
+            4'd6:  sector_lut = {14'd0, img_sector6};
+            4'd7:  sector_lut = {14'd0, img_sector7};
+            4'd8:  sector_lut = {14'd0, img_sector8};
+            4'd9:  sector_lut = {14'd0, img_sector9};
+            4'd10: sector_lut = {14'd0, img_sector10};
+            4'd11: sector_lut = {14'd0, img_sector11};
+            4'd12: sector_lut = {14'd0, img_sector12};
+            4'd13: sector_lut = {14'd0, img_sector13};
+            4'd14: sector_lut = {14'd0, img_sector14};
+            4'd15: sector_lut = {14'd0, img_sector15};
+            default: sector_lut = {14'd0, img_sector0};
         endcase
     end
 endfunction
@@ -277,18 +360,28 @@ always @(posedge clk or posedge rst) begin
         first_image_committed <= 1'b0;
         auto_play_en          <= 1'b0;
         auto_cnt              <= 32'd0;
-        img_found_count       <= 3'd0;
-        img_idx               <= 2'd0;
-        load_idx              <= 2'd0;
+        img_found_count       <= 5'd0;
+        img_idx               <= 4'd0;
+        load_idx              <= 4'd0;
         pending_buf_idx       <= 2'd0;
         write_buf_idx         <= 2'd0;
         disp_buf_idx          <= 2'd0;
-        img_sector0           <= 32'd0;
-        img_sector1           <= 32'd0;
-        img_sector2           <= 32'd0;
-        img_sector3           <= 32'd0;
-        img_sector4           <= 32'd0;
-        img_sector5           <= 32'd0;
+        img_sector0           <= 18'd0;
+        img_sector1           <= 18'd0;
+        img_sector2           <= 18'd0;
+        img_sector3           <= 18'd0;
+        img_sector4           <= 18'd0;
+        img_sector5           <= 18'd0;
+        img_sector6           <= 18'd0;
+        img_sector7           <= 18'd0;
+        img_sector8           <= 18'd0;
+        img_sector9           <= 18'd0;
+        img_sector10          <= 18'd0;
+        img_sector11          <= 18'd0;
+        img_sector12          <= 18'd0;
+        img_sector13          <= 18'd0;
+        img_sector14          <= 18'd0;
+        img_sector15          <= 18'd0;
         next_req_pending      <= 1'b0;
         load_busy             <= 1'b0;
         load_timeout_cnt      <= 32'd0;
@@ -298,8 +391,11 @@ always @(posedge clk or posedge rst) begin
         display_valid         <= 1'b0;
         load_active_seen      <= 1'b0;
         wr_req_seen           <= 1'b0;
-        fail_idx              <= 3'd0;
+        fail_idx              <= 4'd0;
         fail_valid            <= 1'b0;
+        src_commit            <= 1'b0;
+        src_w_lat             <= 16'd0;
+        src_h_lat             <= 16'd0;
     end else begin
         wrfin_tgl_sync   <= {wrfin_tgl_sync[1:0], write_finish_toggle};
         fade_swap_sync   <= {fade_swap_sync[1:0], fade_swap};
@@ -307,24 +403,35 @@ always @(posedge clk or posedge rst) begin
         load_start_pulse <= 1'b0;
         load_abort       <= 1'b0;
         img_shown_pulse  <= 1'b0;
+        src_commit       <= 1'b0;
 
         if (!sd_init_done) begin
             scan_kicked           <= 1'b0;
             first_image_committed <= 1'b0;
             auto_play_en          <= 1'b0;
             auto_cnt              <= 32'd0;
-            img_found_count       <= 3'd0;
-            img_idx               <= 2'd0;
-            load_idx              <= 2'd0;
+            img_found_count       <= 5'd0;
+            img_idx               <= 4'd0;
+            load_idx              <= 4'd0;
             pending_buf_idx       <= 2'd0;
             write_buf_idx         <= 2'd0;
             disp_buf_idx          <= 2'd0;
-            img_sector0           <= 32'd0;
-            img_sector1           <= 32'd0;
-            img_sector2           <= 32'd0;
-            img_sector3           <= 32'd0;
-            img_sector4           <= 32'd0;
-            img_sector5           <= 32'd0;
+            img_sector0           <= 18'd0;
+            img_sector1           <= 18'd0;
+            img_sector2           <= 18'd0;
+            img_sector3           <= 18'd0;
+            img_sector4           <= 18'd0;
+            img_sector5           <= 18'd0;
+            img_sector6           <= 18'd0;
+            img_sector7           <= 18'd0;
+            img_sector8           <= 18'd0;
+            img_sector9           <= 18'd0;
+            img_sector10          <= 18'd0;
+            img_sector11          <= 18'd0;
+            img_sector12          <= 18'd0;
+            img_sector13          <= 18'd0;
+            img_sector14          <= 18'd0;
+            img_sector15          <= 18'd0;
             next_req_pending      <= 1'b0;
             load_busy             <= 1'b0;
             load_timeout_cnt      <= 32'd0;
@@ -336,23 +443,33 @@ always @(posedge clk or posedge rst) begin
             display_valid         <= 1'b0;
             load_active_seen      <= 1'b0;
             wr_req_seen           <= 1'b0;
-            fail_idx              <= 3'd0;
+            fail_idx              <= 4'd0;
             fail_valid            <= 1'b0;
         end else begin
             // 扫描阶段缓存前 4 张图的起始 sector
             if (scan_found_valid) begin
                 case (img_found_count)
-                    3'd0: img_sector0 <= scan_found_sector;
-                    3'd1: img_sector1 <= scan_found_sector;
-                    3'd2: img_sector2 <= scan_found_sector;
-                    3'd3: img_sector3 <= scan_found_sector;
-                    3'd4: img_sector4 <= scan_found_sector;
-                    3'd5: img_sector5 <= scan_found_sector;
+                    5'd0:  img_sector0  <= scan_found_sector[17:0];
+                    5'd1:  img_sector1  <= scan_found_sector[17:0];
+                    5'd2:  img_sector2  <= scan_found_sector[17:0];
+                    5'd3:  img_sector3  <= scan_found_sector[17:0];
+                    5'd4:  img_sector4  <= scan_found_sector[17:0];
+                    5'd5:  img_sector5  <= scan_found_sector[17:0];
+                    5'd6:  img_sector6  <= scan_found_sector[17:0];
+                    5'd7:  img_sector7  <= scan_found_sector[17:0];
+                    5'd8:  img_sector8  <= scan_found_sector[17:0];
+                    5'd9:  img_sector9  <= scan_found_sector[17:0];
+                    5'd10: img_sector10 <= scan_found_sector[17:0];
+                    5'd11: img_sector11 <= scan_found_sector[17:0];
+                    5'd12: img_sector12 <= scan_found_sector[17:0];
+                    5'd13: img_sector13 <= scan_found_sector[17:0];
+                    5'd14: img_sector14 <= scan_found_sector[17:0];
+                    5'd15: img_sector15 <= scan_found_sector[17:0];
                     default: ;
                 endcase
 
-                if (img_found_count < 3'd6)
-                    img_found_count <= img_found_count + 3'd1;
+                if (img_found_count < 5'd16)
+                    img_found_count <= img_found_count + 5'd1;
             end
 
             // 装载确实启动过（bmp_read 离开过 IDLE）、且发出过 write_req（header 匹配），
@@ -391,6 +508,9 @@ always @(posedge clk or posedge rst) begin
                 first_image_committed <= 1'b1;
                 img_shown_pulse       <= 1'b1;
                 fail_valid            <= 1'b0;
+                src_w_lat             <= src_width;
+                src_h_lat             <= src_height;
+                src_commit            <= 1'b1;
             end else if (load_busy && source_done_seen && write_done_seen && first_image_committed && !swap_pending) begin
                 // 后续切图：先触发淡出，等 fade_swap 边沿再切显示缓冲
                 source_done_seen <= 1'b0;
@@ -407,12 +527,18 @@ always @(posedge clk or posedge rst) begin
                 fade_req         <= ~fade_req;      // 请求淡入
                 img_shown_pulse  <= 1'b1;
                 fail_valid       <= 1'b0;
+                src_w_lat        <= src_width;
+                src_h_lat        <= src_height;
+                src_commit       <= 1'b1;
             end else if (load_busy) begin
                 // 超时覆盖 swap_pending：防止 fade 握手丢失时 swap_pending 永久挂起导致 K2 彻底失效。
-                // 2s 阈值 > 最坏正常时长（装载约 0.5s + fade 全程转场约 0.54s）
-                if (want_wav) begin
-                    // WAV 补水占用 SD 总线：装载等待，不计超时
-                end else if (load_timeout_cnt > 32'd200_000_000) begin
+                // 3s 阈值 > 最坏正常时长（装载约 0.6s + 全程转场约 0.54s）。
+                // 注意：不能再用 want_wav 冻结计数——WAV 补水若长期霸占总线，
+                // 冻结会让"装载卡死"永远不恢复，上板表现为播几张后画面卡住。
+                // bmp_busy_timeout：SD 核丢了本次扇区请求（1.5ms 无 end）。
+                // 此时 bmp 一直拉着 sd_sec_read，光清 bmp_rd_busy 也抢不回总线，
+                // 直接按"坏图"处理跳过，免得整机冻结到 3s 超时。
+                if ((load_timeout_cnt > 32'd300_000_000) || bmp_busy_timeout) begin
                     // 超时（例如读到坏图或截断的文件导致死锁），强制释放 busy 以恢复按键响应
                     load_busy             <= 1'b0;
                     load_timeout_cnt      <= 32'd0;
@@ -429,16 +555,16 @@ always @(posedge clk or posedge rst) begin
                 load_timeout_cnt <= 32'd0;
             end
 
-            // 上电后自动发起一次“扫描前 6 张 BMP”
+            // 上电后自动发起一次"扫描前 16 张 BMP"
             if (!scan_kicked && bmp_ready) begin
                 scan_start_pulse      <= 1'b1;
                 scan_kicked           <= 1'b1;
                 first_image_committed <= 1'b0;
                 auto_play_en          <= 1'b0;
                 auto_cnt              <= 32'd0;
-                img_found_count       <= 3'd0;
-                img_idx               <= 2'd0;
-                load_idx              <= 2'd0;
+                img_found_count       <= 5'd0;
+                img_idx               <= 4'd0;
+                load_idx              <= 4'd0;
                 pending_buf_idx       <= 2'd0;
                 write_buf_idx         <= 2'd0;
                 disp_buf_idx          <= 2'd0;
@@ -449,7 +575,7 @@ always @(posedge clk or posedge rst) begin
                 write_done_seen       <= 1'b0;
             end else begin
                 // 忙的时候也只记 1 次“下一张”请求，不会累积成连跳两张
-                if (key_next_press && scan_done && (img_found_count > 3'd0))
+                if (key_next_press && scan_done && (img_found_count != 5'd0))
                     next_req_pending <= 1'b1;
 
                 // 自动播放开/关（电平控制，来自 ctrl 的 o_auto_play）
@@ -458,7 +584,7 @@ always @(posedge clk or posedge rst) begin
                 auto_play_en <= auto_play_level;
 
                 // 自动播放 1s 计数：只有当前没有写图任务时才计时
-                if (scan_done && auto_play_en && display_valid && !load_busy && first_image_committed && (img_found_count > 3'd1)) begin
+                if (scan_done && auto_play_en && display_valid && !load_busy && first_image_committed && (img_found_count > 5'd1)) begin
                     if (auto_tick)
                         auto_cnt <= 32'd0;
                     else
@@ -468,8 +594,8 @@ always @(posedge clk or posedge rst) begin
                 end
 
                 // 首图自动加载到 buffer0（若首图坏则沿 fail 链继续尝试后续图片）
-                if (scan_done && !first_image_committed && bmp_ready && !load_busy && (img_found_count != 3'd0)) begin
-                    load_idx         <= fail_valid ? next_from_current : 3'd0;
+                if (scan_done && !first_image_committed && bmp_ready && !load_busy && (img_found_count != 5'd0)) begin
+                    load_idx         <= fail_valid ? next_from_current : 4'd0;
                     load_sector      <= fail_valid ? sector_lut(next_from_current) : img_sector0;
                     pending_buf_idx  <= 2'd0;
                     write_buf_idx    <= 2'd0;
@@ -484,7 +610,7 @@ always @(posedge clk or posedge rst) begin
                     auto_cnt         <= 32'd0;
                 end
                 // 手动下一张优先：写到“非当前显示”的另一块 buffer
-                else if (scan_done && bmp_ready && display_valid && !load_busy && next_req_pending && (img_found_count != 3'd0)) begin
+                else if (scan_done && bmp_ready && display_valid && !load_busy && next_req_pending && (img_found_count != 5'd0)) begin
                     load_idx         <= next_from_current;
                     load_sector      <= sector_lut(next_from_current);
                     pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
@@ -500,7 +626,7 @@ always @(posedge clk or posedge rst) begin
                     auto_cnt         <= 32'd0;
                 end
                 // 自动播放下一张：同样写到“非当前显示”的另一块 buffer
-                else if (scan_done && bmp_ready && display_valid && !load_busy && auto_play_en && auto_tick && (img_found_count > 3'd1)) begin
+                else if (scan_done && bmp_ready && display_valid && !load_busy && auto_play_en && auto_tick && (img_found_count > 5'd1)) begin
                     load_idx         <= next_from_current;
                     load_sector      <= sector_lut(next_from_current);
                     pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
@@ -645,6 +771,36 @@ always @(posedge clk or posedge rst) begin
         shown_bcd <= 24'd0;
     else if (img_shown_pulse)
         shown_bcd <= {bcd_n5, bcd_n4, bcd_n3, bcd_n2, bcd_n1, bcd_n0};
+end
+
+// ---- 源尺寸二进制 → BCD（double dabble，11 拍）----
+// 转换完成后再翻转 o_src_tgl，保证 video 域锁存到的 BCD 一定已经稳定
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        dab_w       <= 27'd0;
+        dab_h       <= 27'd0;
+        dab_cnt     <= 4'd0;
+        dab_busy    <= 1'b0;
+        o_src_w_bcd <= 16'h0640;
+        o_src_h_bcd <= 16'h0480;
+        o_src_tgl   <= 1'b0;
+    end else if (src_commit) begin
+        dab_w    <= {16'd0, src_w_lat[10:0]};
+        dab_h    <= {16'd0, src_h_lat[10:0]};
+        dab_cnt  <= 4'd0;
+        dab_busy <= 1'b1;
+    end else if (dab_busy) begin
+        if (dab_cnt == 4'd11) begin
+            dab_busy    <= 1'b0;
+            o_src_w_bcd <= dab_w[26:11];
+            o_src_h_bcd <= dab_h[26:11];
+            o_src_tgl   <= ~o_src_tgl;
+        end else begin
+            dab_w   <= dab_w_nxt;
+            dab_h   <= dab_h_nxt;
+            dab_cnt <= dab_cnt + 4'd1;
+        end
+    end
 end
 
 endmodule

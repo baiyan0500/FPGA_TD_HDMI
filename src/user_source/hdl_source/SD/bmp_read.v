@@ -7,11 +7,11 @@ module bmp_read(
     input                       scan_start,
     input  [31:0]               scan_start_sector,
     input  [31:0]               scan_max_sector,
-    input  [2:0]                scan_target_count,
+    input  [4:0]                scan_target_count,
     output reg                  scan_done,
     output reg                  scan_found_valid,
     output reg [31:0]           scan_found_sector,
-    output reg [2:0]            scan_found_total,
+    output reg [4:0]            scan_found_total,
     output reg                  wav_found,          // 扫描发现 WAV 文件
     output reg [31:0]           wav_start_sector,   // WAV 起始扇区
 
@@ -66,11 +66,19 @@ reg [1:0]  bmp_byte_idx;
 reg [12:0] row_bytes;          // 当前行内偏移（含行尾 4 字节对齐填充）
 reg [10:0] pix_row;            // 已完成的像素行数
 
+// 扫描步进：未命中的扇区一次跳过 8 个（4KB）。文件起始扇区一定落在簇边界上，
+// exFAT/大簇 FAT32 的簇 ≥ 4KB，因此不会漏文件；逐扇区扫描时 1.7 万个空扇区
+// （本卡 03_3 到 WAV 之间）要花 2.8s，改为 4KB 步进后约 0.35s。
+// 每次未命中都对齐到 8 的整数倍，避免文件跳转把扫描栅格带偏后漏掉后续文件。
+// 注意：不能用"连续空档多少次就收工"的预算来限时——FAT32 的 FAT 表本身就在
+// 数据区之前，32GB/4KB 簇的卡 FAT 约 32MB，空档远超任何小预算；一旦提前收工
+// 就是"0 张图片，显示 NO IMAGE ON SD"。只能以 scan_max_sector 为界扫满。
+localparam [31:0] SCAN_STEP      = 32'd8;
+
 // RIFF/WAVE 头锁存（扫描期识别 WAV 文件）
 reg [7:0]  riff_id0, riff_id1, riff_id2, riff_id3;
 reg [7:0]  wave_id0, wave_id1, wave_id2, wave_id3;
 reg [31:0] riff_size;
-reg [8:0]  post_scan_cnt;     // 图满后继续找 WAV 的空闲扇区预算
 
 wire header_match;
 wire wav_match;
@@ -132,7 +140,7 @@ assign bmp_data_valid = (sd_sec_read_data_valid == 1'b1) &&
                         (row_bytes < row_pix_bytes) &&
                         (pix_row < height[10:0]);
 assign next_scan_sector_if_match = scan_sector + file_sector_count_q;
-assign next_scan_sector_if_miss  = scan_sector + 32'd1;
+assign next_scan_sector_if_miss  = (scan_sector + SCAN_STEP) & 32'hFFFF_FFF8;
 // RIFF size = 文件长度 - 8，占 (riff_size + 8 + 511) >> 9 个扇区
 assign next_scan_sector_if_wav   = scan_sector + wav_skip_sectors_q;
 
@@ -334,10 +342,9 @@ always @(posedge clk or posedge rst) begin
         scan_done         <= 1'b0;
         scan_found_valid  <= 1'b0;
         scan_found_sector <= 32'd0;
-        scan_found_total  <= 3'd0;
+        scan_found_total  <= 5'd0;
         wav_found         <= 1'b0;
         wav_start_sector  <= 32'd0;
-        post_scan_cnt     <= 9'd0;
         scan_sector       <= 32'd0;
         load_sector_latched <= 32'd0;
     end else if (!sd_init_done) begin
@@ -349,10 +356,9 @@ always @(posedge clk or posedge rst) begin
         scan_done         <= 1'b0;
         scan_found_valid  <= 1'b0;
         scan_found_sector <= 32'd0;
-        scan_found_total  <= 3'd0;
+        scan_found_total  <= 5'd0;
         wav_found         <= 1'b0;
         wav_start_sector  <= 32'd0;
-        post_scan_cnt     <= 9'd0;
         scan_sector       <= 32'd0;
         load_sector_latched <= 32'd0;
     end else if (load_abort) begin
@@ -375,7 +381,7 @@ always @(posedge clk or posedge rst) begin
 
                 if (scan_start) begin
                     scan_done        <= 1'b0;
-                    scan_found_total <= 3'd0;
+                    scan_found_total <= 5'd0;
                     scan_sector      <= scan_start_sector;
                     sd_sec_read_addr <= scan_start_sector;
                     state            <= ST_SCAN;
@@ -396,12 +402,9 @@ always @(posedge clk or posedge rst) begin
                     if (header_ok_r) begin
                         scan_found_valid  <= 1'b1;
                         scan_found_sector <= scan_sector;
-                        scan_found_total  <= scan_found_total + 3'd1;
+                        scan_found_total  <= scan_found_total + 5'd1;
 
-                        if (scan_found_total + 3'd1 >= scan_target_count)
-                            post_scan_cnt <= 9'd256;   // 图满后继续找 WAV 的空闲扇区预算
-
-                        if (((scan_found_total + 3'd1 >= scan_target_count) && wav_found) ||
+                        if (((scan_found_total + 5'd1 >= scan_target_count) && wav_found) ||
                             (next_scan_sector_if_match > scan_max_sector)) begin
                             scan_done <= 1'b1;
                             state     <= ST_IDLE;
@@ -420,19 +423,10 @@ always @(posedge clk or posedge rst) begin
                         sd_sec_read_addr <= next_scan_sector_if_wav;
                         scan_sector      <= next_scan_sector_if_wav;
                     end else begin
+                        // 未命中：4KB 对齐步进，扫到 scan_max_sector 为止
                         if (scan_sector >= scan_max_sector) begin
                             scan_done <= 1'b1;
                             state     <= ST_IDLE;
-                        end else if (scan_found_total >= scan_target_count) begin
-                            // 图已满但未遇 WAV：限额扫描空闲扇区
-                            if (post_scan_cnt == 9'd0) begin
-                                scan_done <= 1'b1;
-                                state     <= ST_IDLE;
-                            end else begin
-                                post_scan_cnt   <= post_scan_cnt - 9'd1;
-                                sd_sec_read_addr <= next_scan_sector_if_miss;
-                                scan_sector      <= next_scan_sector_if_miss;
-                            end
                         end else begin
                             sd_sec_read_addr <= next_scan_sector_if_miss;
                             scan_sector      <= next_scan_sector_if_miss;
@@ -467,11 +461,17 @@ always @(posedge clk or posedge rst) begin
 
             ST_LOAD_DATA: begin
                 state_code  <= 4'd4;
-                if (i_stall) begin
-                    sd_sec_read <= 1'b0;   // 背压暂停
-                end else begin
+                // 背压只在扇区边界生效：SD 核只在固定窗口采样 sd_sec_read，
+                // 中途撤销会让请求被丢弃（end 永不到来），仲裁器 bmp_rd_busy
+                // 因此卡在 1，WAV 永远拿不到总线 → 播几张后整机死锁。
+                // 停一拍后必须"保持低"直到 i_stall 解除，否则背压形同虚设，
+                // scaler 输入 FIFO 会在一个扇区内溢出丢像素。
+                if (sd_sec_read_end)
+                    sd_sec_read <= ~i_stall;
+                else if (!sd_sec_read)
+                    sd_sec_read <= ~i_stall;
+                else
                     sd_sec_read <= 1'b1;
-                end
 
                 if (sd_sec_read_end) begin
                     // 高度行已全部送完即停（文件尾部可能还有填充/附加数据）；

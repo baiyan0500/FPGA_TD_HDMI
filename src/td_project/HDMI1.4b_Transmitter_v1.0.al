@@ -518,6 +518,16 @@
             </UserParams>
         </Run>
     </Runs>
+    <MultiSeed>
+        <Property Enable="true" GenBit="true" EndStep="bitgen" Random="false" Num="1" Init="2" Jobs="1" Save="1" Step="1">
+            <Filter enabled="false">
+                <congestion>100</congestion>
+                <place_swns>0</place_swns>
+                <route_swns>0</route_swns>
+            </Filter>
+        </Property>
+        <Seeds select="2">2 </Seeds>
+    </MultiSeed>
     <Project_Settings>
     </Project_Settings>
 </Project>

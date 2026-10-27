@@ -46,24 +46,35 @@ module scaler #(
     reg [23:0] fifo_dout_r;      // fifo 同步读数据
 
     // ---- 行缓存 ----
-    // 1024x24 显式例化 BRAM9K 原语：综合器对该深度拒绝 block_ram 推断
-    // （SYN-1027 仍推成 DRAM 吃掉 ~3k LUT，导致 x7y2 布线冲突）
-    // NOREG 模式读延迟 1 拍，与原 "lbuf_dout_r <= line_buf[rd_x]" 时序完全一致
-    wire [23:0] lbuf_dout_r;     // BRAM B 口同步读数据（地址给出后下一拍有效）
+    // 两个独立的 512x24 单块 RAM（x 低位体 / 高位体），而不是一块 1024x24。
+    // 1024 深的 DP RAM 需要 3 块 BRAM9K 级联，级联体选择由综合器生成；
+    // 上板实测 1024 宽源图出现左右半幅互换（源 x 与 x^512 对调），而 ≤640 宽
+    // 源图正常，怀疑就是级联体选择在 NOREG + 读地址每拍变化时错位。
+    // 改成两块独立 RAM 后，体选择落在 LUT 逻辑里，时序完全由 RTL 决定。
+    wire        wr_hi;                        // 写体选择（源宽 >512 才用高位体）
+    reg         rd_hi_q;                      // 读体选择，与 dob 同拍对齐
+    wire [23:0] lbuf_dob_lo;
+    wire [23:0] lbuf_dob_hi;
+    wire [23:0] lbuf_dout_r = rd_hi_q ? lbuf_dob_hi : lbuf_dob_lo;
 
-    localparam S_IDLE      = 3'd0;
-    localparam S_READ_ADDR = 3'd1;
-    localparam S_READ_DATA = 3'd2;
-    localparam S_OUT_ADDR  = 3'd3;
-    localparam S_OUT_DATA  = 3'd4;
-    localparam S_DONE      = 3'd5;
+    localparam S_IDLE       = 3'd0;
+    localparam S_READ_ADDR  = 3'd1;
+    localparam S_READ_DATA  = 3'd2;
+    localparam S_OUT_ADDR   = 3'd3;
+    localparam S_OUT_DATA   = 3'd4;
+    localparam S_DONE       = 3'd5;
+    localparam S_DRAIN      = 3'd6;   // 丢弃剩余源行（源高 > 480 时输出已满仍要排空 FIFO）
+    localparam S_DRAIN_DATA = 3'd7;
 
     reg [2:0]  state;
     reg [10:0] src_w_l, src_h_l;
+    reg [10:0] src_row_cnt;           // 已消费（含跳过）的源行数
     reg [10:0] wr_x, rd_x;
     reg [10:0] dst_x, dst_y;
     reg [11:0] x_acc, y_acc;
     reg        skip_cnt;
+
+    assign wr_hi = wr_x[9];
 
     // 水平 DDA（最多减 2 次）
     wire [11:0] xa1 = x_acc + {1'b0, src_w_l};
@@ -81,8 +92,11 @@ module scaler #(
     wire [11:0] y_acc_next = y_ov1 ? (y_ov2 ? (ya2 - 12'd480) : ya2) : ya1;
 
     // ---- FIFO 写 ----
+    // start_edge 清空上一帧残留：新图启动时 FIFO 里若还有旧图像素，
+    // 会被当成新图第一行写进行缓存，整帧错位。
     always @(posedge clk or posedge rst) begin
         if (rst) fifo_wptr <= 9'd0;
+        else if (start_edge) fifo_wptr <= 9'd0;
         else if (fifo_wr) begin
             fifo_mem[fifo_wptr] <= src_data;
             fifo_wptr <= fifo_wptr + 9'd1;
@@ -92,36 +106,59 @@ module scaler #(
     // ---- FIFO 同步读 ----
     always @(posedge clk or posedge rst) begin
         if (rst) fifo_dout_r <= 24'd0;
-        else if (state == S_READ_ADDR && !fifo_empty)
+        else if ((state == S_READ_ADDR || state == S_DRAIN) && !fifo_empty)
             fifo_dout_r <= fifo_mem[fifo_rptr];
     end
 
-    // ---- line_buf BRAM 例化（A 口写 / B 口读，单时钟伪双口）----
+    // ---- line_buf 例化：两个 512x24 单块 RAM（A 口写 / B 口读）----
     // 写：S_READ_DATA 状态每拍写入 fifo_dout_r；读：S_OUT_ADDR 拍给出 rd_x，
     // 下一拍（S_OUT_DATA）dob 有效，时序与原同步读完全一致
     EG_LOGIC_BRAM #(
-        .DATA_WIDTH_A(24), .ADDR_WIDTH_A(10),
-        .DATA_WIDTH_B(24), .ADDR_WIDTH_B(10),
+        .DATA_WIDTH_A(24), .ADDR_WIDTH_A(9),
+        .DATA_WIDTH_B(24), .ADDR_WIDTH_B(9),
         .MODE("DP"), .REGMODE_A("NOREG"), .REGMODE_B("NOREG"),
         .WRITEMODE_A("NORMAL"), .WRITEMODE_B("NORMAL"),
         .RESETMODE("SYNC"), .IMPLEMENT("9K")
-    ) u_line_buf (
-        .dia(fifo_dout_r), .addra(wr_x[9:0]), .cea(1'b1), .ocea(1'b1),
-        .clka(clk), .wea(state == S_READ_DATA), .rsta(1'b0), .bea(1'b1),
-        .dib(24'd0), .addrb(rd_x[9:0]), .ceb(1'b1), .oceb(1'b1),
+    ) u_line_buf_lo (
+        .dia(fifo_dout_r), .addra(wr_x[8:0]), .cea(1'b1), .ocea(1'b1),
+        .clka(clk), .wea(state == S_READ_DATA && !wr_hi), .rsta(1'b0), .bea(1'b1),
+        .dib(24'd0), .addrb(rd_x[8:0]), .ceb(1'b1), .oceb(1'b1),
         .clkb(clk), .web(1'b0), .rstb(1'b0), .beb(1'b1),
-        .doa(), .dob(lbuf_dout_r)
+        .doa(), .dob(lbuf_dob_lo)
     );
+
+    EG_LOGIC_BRAM #(
+        .DATA_WIDTH_A(24), .ADDR_WIDTH_A(9),
+        .DATA_WIDTH_B(24), .ADDR_WIDTH_B(9),
+        .MODE("DP"), .REGMODE_A("NOREG"), .REGMODE_B("NOREG"),
+        .WRITEMODE_A("NORMAL"), .WRITEMODE_B("NORMAL"),
+        .RESETMODE("SYNC"), .IMPLEMENT("9K")
+    ) u_line_buf_hi (
+        .dia(fifo_dout_r), .addra(wr_x[8:0]), .cea(1'b1), .ocea(1'b1),
+        .clka(clk), .wea(state == S_READ_DATA && wr_hi), .rsta(1'b0), .bea(1'b1),
+        .dib(24'd0), .addrb(rd_x[8:0]), .ceb(1'b1), .oceb(1'b1),
+        .clkb(clk), .web(1'b0), .rstb(1'b0), .beb(1'b1),
+        .doa(), .dob(lbuf_dob_hi)
+    );
+
+    // 读体选择跟随 addrb 打一拍（与 NOREG 的 1 拍读延迟对齐）
+    always @(posedge clk or posedge rst) begin
+        if (rst) rd_hi_q <= 1'b0;
+        else     rd_hi_q <= rd_x[9];
+    end
 
     // ---- FIFO 读指针 + 计数 ----
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             fifo_rptr <= 9'd0;
             fifo_cnt  <= 10'd0;
+        end else if (start_edge) begin
+            fifo_rptr <= 9'd0;
+            fifo_cnt  <= 10'd0;
         end else begin
-            if (state == S_READ_ADDR && !fifo_empty)
+            if ((state == S_READ_ADDR || state == S_DRAIN) && !fifo_empty)
                 fifo_rptr <= fifo_rptr + 9'd1;
-            case ({fifo_wr, (state == S_READ_ADDR && !fifo_empty)})
+            case ({fifo_wr, ((state == S_READ_ADDR || state == S_DRAIN) && !fifo_empty)})
                 2'b10:   fifo_cnt <= fifo_cnt + 10'd1;
                 2'b01:   fifo_cnt <= fifo_cnt - 10'd1;
                 default: fifo_cnt <= fifo_cnt;
@@ -137,6 +174,7 @@ module scaler #(
             dst_data <= 24'd0;
             done     <= 1'b0;
             src_w_l  <= 11'd0; src_h_l <= 11'd0;
+            src_row_cnt <= 11'd0;
             wr_x     <= 11'd0; rd_x <= 11'd0;
             dst_x    <= 11'd0; dst_y <= 11'd0;
             x_acc    <= 12'd0; y_acc <= 12'd0;
@@ -148,6 +186,7 @@ module scaler #(
                 // 任意状态下收到 start 都强制重启（防止上一帧卡死导致后续无法恢复）
                 src_w_l  <= (src_w[10:0] == 11'd0) ? 11'd1 : src_w[10:0];
                 src_h_l  <= (src_h[10:0] == 11'd0) ? 11'd1 : src_h[10:0];
+                src_row_cnt <= 11'd0;
                 wr_x     <= 11'd0;
                 dst_y    <= 11'd0;
                 y_acc    <= 12'd0;
@@ -167,6 +206,7 @@ module scaler #(
                     wr_x <= wr_x + 11'd1;
                     if (wr_x == src_w_l - 11'd1) begin
                         wr_x <= 11'd0;
+                        src_row_cnt <= src_row_cnt + 11'd1;
                         if (skip_cnt) begin
                             skip_cnt <= 1'b0;   // 跳过这一行，重新读
                             state    <= S_READ_ADDR;
@@ -196,7 +236,14 @@ module scaler #(
                         y_acc <= y_acc_next;
                         if (y_ov1) begin
                             if (dst_y == DST_H - 11'd1) begin
-                                state <= S_DONE;
+                                // 480 行输出完毕，但源高可能大于 480：剩余源行必须消费掉，
+                                // 否则输入 FIFO 被写满，bmp_read 永久 stall 在装载态。
+                                if (src_row_cnt == src_h_l) begin
+                                    state <= S_DONE;
+                                end else begin
+                                    wr_x  <= 11'd0;
+                                    state <= S_DRAIN;
+                                end
                             end else begin
                                 wr_x     <= 11'd0;
                                 skip_cnt <= y_ov2;
@@ -210,6 +257,23 @@ module scaler #(
                         end
                     end else begin
                         state <= S_OUT_ADDR;
+                    end
+                end
+                S_DRAIN: begin
+                    if (!fifo_empty)
+                        state <= S_DRAIN_DATA;
+                end
+                S_DRAIN_DATA: begin
+                    if (wr_x == src_w_l - 11'd1) begin
+                        wr_x <= 11'd0;
+                        src_row_cnt <= src_row_cnt + 11'd1;
+                        if (src_row_cnt == src_h_l - 11'd1)
+                            state <= S_DONE;
+                        else
+                            state <= S_DRAIN;
+                    end else begin
+                        wr_x  <= wr_x + 11'd1;
+                        state <= S_DRAIN;
                     end
                 end
                 S_DONE: begin

@@ -1,0 +1,13 @@
+{
+  "name": "docx2md",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Convert .docx files to Markdown or plain text",
+  "bin": {
+    "docx2md": "docx2md.js"
+  },
+  "dependencies": {
+    "mammoth": "^1.11.0",
+    "turndown": "^7.2.0"
+  }
+}

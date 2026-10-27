@@ -4,17 +4,32 @@ Thumbs.db
 # Tool logs
 *.log
 *.logw
+!docs/reports/*.log
 
 # Common temporary and cache files
 *.tmp
 *.bak
 *.swp
+*.dmp
+transcript
+*.lock.f
+__pycache__/
+*.pyc
+
+# ModelSim generated outputs
+sim/work/
+sim/*.wlf
+sim/dump_seq.txt
 
 # FPGA tool generated outputs
 src/td_project/log/
 src/td_project/work/
+src/td_project/out/
 src/td_project/*_Runs/
 src/user_source/hdl_source/work/
+
+# Node dependencies (reinstall with npm install)
+node_modules/
 
 # Optional editor/tool state
 src/td_project/.recent_user_depot.ini

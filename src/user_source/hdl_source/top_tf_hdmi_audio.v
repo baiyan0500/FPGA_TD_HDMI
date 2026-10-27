@@ -87,7 +87,10 @@ wire [23:0] osd_rgb;
 wire        display_valid;
 
 wire [3:0]  state_code;
-wire [2:0]  img_count;
+wire [4:0]  img_count;
+wire [15:0] src_w_bcd;
+wire [15:0] src_h_bcd;
+wire        src_tgl;
 wire        sd_ready;
 wire        scan_done_sd;
 wire [6:0]  seg_data_0;
@@ -225,7 +228,7 @@ sd_card_bmp #(
     .CLK_FREQ_HZ       (100_000_000),
     .SCAN_START_SECTOR (32'd0),
     .SCAN_MAX_SECTOR   (32'd131071),
-    .SCAN_TARGET_COUNT (3'd6)
+    .SCAN_TARGET_COUNT (5'd16)
 ) sd_card_bmp_m0(
     .clk               (sd_card_clk),
     .rst               (rst_all),
@@ -245,6 +248,9 @@ sd_card_bmp #(
     .fade_swap         (fade_swap),
     .fade_req          (fade_req),
     .shown_bcd         (shown_bcd),
+    .o_src_w_bcd       (src_w_bcd),
+    .o_src_h_bcd       (src_h_bcd),
+    .o_src_tgl         (src_tgl),
 
     .write_req         (sd_card_write_req),
     .write_req_ack     (sd_card_write_req_ack),
@@ -339,12 +345,12 @@ assign vout_data = display_valid_s2 ? vout_data_raw : 24'd0;
 // 启动状态跨域：100MHz 准静态电平 → video_clk 2 级同步
 reg        sd_ready_s1, sd_ready_s2;
 reg        scan_done_s1, scan_done_s2;
-reg [2:0]  img_count_s1, img_count_s2;
+reg [4:0]  img_count_s1, img_count_s2;
 always @(posedge video_clk or posedge rst_all) begin
     if (rst_all) begin
         sd_ready_s1  <= 1'b0;  sd_ready_s2  <= 1'b0;
         scan_done_s1 <= 1'b0;  scan_done_s2 <= 1'b0;
-        img_count_s1 <= 3'd0;  img_count_s2 <= 3'd0;
+        img_count_s1 <= 5'd0;  img_count_s2 <= 5'd0;
     end else begin
         sd_ready_s1  <= sd_ready;
         sd_ready_s2  <= sd_ready_s1;
@@ -354,6 +360,9 @@ always @(posedge video_clk or posedge rst_all) begin
         img_count_s2 <= img_count_s1;
     end
 end
+// 源尺寸 BCD 为 100MHz 域准静态总线，与 src_tgl 一同更新；
+// osd_layer 内部用 2 级同步的 toggle 边沿锁存，无需在此再打拍
+
 
 // ===================== UART 上位机标语接收 =====================
 uart_rx #(
@@ -459,6 +468,9 @@ osd_layer u_osd_layer(
     .i_sd_init_done(sd_ready_s2),
     .i_scan_done(scan_done_s2),
     .i_img_count(img_count_s2),
+    .i_src_w_bcd(src_w_bcd),
+    .i_src_h_bcd(src_h_bcd),
+    .i_src_tgl(src_tgl),
     .i_auto_play(ctrl_auto_play),
     .o_hs       (),
     .o_vs       (osd_vs),
