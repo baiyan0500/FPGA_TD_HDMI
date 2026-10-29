@@ -10,6 +10,7 @@ module sd_card_sec_read_write
 	output reg       sd_init_done,
 	input            sd_sec_read,
 	input[31:0]      sd_sec_read_addr,
+	input[15:0]      sd_sec_read_count,   // 连续读扇区数（>1 时用 CMD18 流式读）
 	output[7:0]      sd_sec_read_data,
 	output           sd_sec_read_data_valid,
 	output           sd_sec_read_end,
@@ -52,12 +53,34 @@ localparam S_WRITE_END          = 15;
 localparam S_READ_END           = 16;
 localparam S_WAIT_READ_WRITE    = 17;
 localparam S_CMD16              = 18;
+localparam S_CMD18              = 19;
+localparam S_READ_WAIT          = 20;   // 读端多等一拍：结束脉冲晚一拍后，客户端仍有时间更新地址
 
 reg[4:0]                       state;
 reg[31:0]                      sec_addr;
-assign sd_sec_read_data_valid = (state == S_READ) && block_read_valid;
-assign sd_sec_read_data = block_read_data;
-assign sd_sec_read_end = (state == S_READ_END);
+reg[15:0]                      sec_left;       // 本批剩余扇区数（含当前扇区）
+reg                            sec_end_pulse;  // 每扇区结束单拍脉冲
+
+// 读数据/有效/结束三者寄存一级后一起输出：原来 valid = state 组合译码直连所有
+// 客户端的字节计数器，形成"SD 核 state → bmp_read/wav 计数 CE"约 10.5ns 的长链。
+// 三者同拍延迟，对客户端只相当于整体晚一拍，字节流与扇区结束的相对时序不变。
+reg [7:0]                      rd_data_q;
+reg                            rd_valid_q;
+reg                            rd_end_q;
+always@(posedge clk or posedge rst) begin
+    if(rst) begin
+        rd_data_q  <= 8'd0;
+        rd_valid_q <= 1'b0;
+        rd_end_q   <= 1'b0;
+    end else begin
+        rd_data_q  <= block_read_data;
+        rd_valid_q <= (state == S_READ) && block_read_valid;
+        rd_end_q   <= sec_end_pulse;
+    end
+end
+assign sd_sec_read_data_valid = rd_valid_q;
+assign sd_sec_read_data = rd_data_q;
+assign sd_sec_read_end = rd_end_q;
 assign sd_sec_write_data_req = (state == S_WRITE) && block_write_data_rd;
 assign block_write_data = sd_sec_write_data;
 assign sd_sec_write_end = (state == S_WRITE_END);
@@ -75,9 +98,13 @@ begin
 		block_write_req <= 1'b0;
 		block_read_req <= 1'b0;
 		sec_addr <= 32'd0;
+		sec_left <= 16'd1;
+		sec_end_pulse <= 1'b0;
 		sd_init_done <= 1'b0;
 	end
 	else
+	begin
+		sec_end_pulse <= 1'b0;
 		case(state)
 			S_IDLE:
 			begin
@@ -181,8 +208,9 @@ begin
 				end
 				else if(sd_sec_read == 1'b1)
 				begin
-					state <= S_CMD17;
 					sec_addr <= sd_sec_read_addr;
+					sec_left <= (sd_sec_read_count <= 16'd1) ? 16'd1 : sd_sec_read_count;
+					state    <= (sd_sec_read_count > 16'd1) ? S_CMD18 : S_CMD17;
 				end
 
 				spi_clk_div <= 16'd0;
@@ -228,12 +256,33 @@ begin
 					cmd <= {8'd17,sec_addr,8'hff};
 				end
 			end
+			S_CMD18:
+			begin
+				if(cmd_req_ack & ~cmd_req_error)
+				begin
+					state <= S_READ;
+					cmd_req <= 1'b0;
+				end
+				else
+				begin
+					cmd_req <= 1'b1;
+					cmd_data_len <= 16'd0;
+					cmd_r1 <= 8'h00;
+					cmd <= {8'd18,sec_addr,8'hff};
+				end
+			end
 			S_READ:
 			begin
 				if(block_read_req_ack)
 				begin
-					state <= S_READ_END;
-					block_read_req <= 1'b0;
+					sec_end_pulse <= 1'b1;
+					if(sec_left <= 16'd1)
+					begin
+						state <= S_READ_END;
+						block_read_req <= 1'b0;
+					end
+					else
+						sec_left <= sec_left - 16'd1;
 				end
 				else
 				begin
@@ -246,10 +295,15 @@ begin
 			end
 			S_READ_END:
 			begin
+				state <= S_READ_WAIT;
+			end
+			S_READ_WAIT:
+			begin
 				state <= S_WAIT_READ_WRITE;
 			end
 			default:
 				state <= S_IDLE;
 		endcase
+	end
 end
 endmodule

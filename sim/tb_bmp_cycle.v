@@ -38,6 +38,16 @@ module tb_bmp_cycle;
     wire        SD_nCS, SD_DCLK, SD_MOSI;
     reg         SD_MISO = 1;
     reg         wav_pause = 0;
+    reg         vp = 0;                  // 视频层独占请求（模拟 layer3 进入/退出）
+    integer     abort_cnt = 0;           // 装载被看门狗放弃的次数（交接测试要求为 0）
+    // 行为级 SD 卡核的扇区流状态（声明提前，供交接测试任务引用）
+    reg         be_busy = 0;
+    reg  [31:0] be_addr = 0;
+    integer     be_idx = 0;
+    reg  [3:0]  be_startup = 0;
+    reg  [1:0]  be_cool = 0;
+    wire        sd_mux_read = dut.sd_sec_read_mux;
+    wire [31:0] sd_mux_addr = dut.sd_sec_addr_mux;
     wire        wav_active;
     wire [32:0] wav_rate_step;
     wire        wav_stereo;
@@ -94,9 +104,10 @@ module tb_bmp_cycle;
         .wav_fifo_rd_en    (wav_fifo_rd_en),
         .wav_fifo_rd_data  (wav_fifo_rd_data),
         .wav_fifo_empty    (wav_fifo_empty),
-        .i_video_play      (1'b0),
+        .i_video_play      (vp),
         .i_egv_sd_read     (1'b0),
         .i_egv_sd_addr     (32'd0),
+        .i_egv_sd_count    (16'd1),
         .o_cli_data_valid  (),
         .o_cli_data        (),
         .o_cli_read_end    (),
@@ -299,6 +310,75 @@ module tb_bmp_cycle;
         end
     endtask
 
+    // ---------------- 视频客户端独占交接（必须在扇区边界）----------------
+    // 旧实现 egv_owns = i_video_play 直接切 mux：视频会先收到 BMP 在途扇区尾部字节，
+    // 逐字节计数整体错位 → 上板表现为图像错位 + 音频错乱。这里在扇区中途拉高 vp，
+    // 检查交接推迟到扇区结束、独占期间 BMP 不再发起读、退出后装载能续传完成。
+    task video_handoff_test;
+        integer ho_err;
+        begin
+            ho_err = 0;
+            $display("HANDOFF: start (t=%0t)", $time);
+            press_next;
+            k = 0;
+            while (!(dut.load_busy && be_busy && be_startup == 0 &&
+                     be_idx > 32 && be_idx < 480) && k < 5_000_000) begin
+                @(posedge clk); k = k + 1;
+            end
+            if (k >= 5_000_000) begin
+                $display(">>> HANDOFF: no in-flight sector found"); ho_err = ho_err + 1;
+            end
+            @(negedge clk);
+            vp = 1;
+            repeat (6) @(posedge clk);
+            if (dut.egv_owns_r) begin
+                $display(">>> HANDOFF: bus taken mid-sector (load_busy=%b be_idx=%0d)",
+                         dut.load_busy, be_idx);
+                ho_err = ho_err + 1;
+            end
+            k = 0;
+            while (!dut.egv_owns_r && k < 4_000_000) begin @(posedge clk); k = k + 1; end
+            if (!dut.egv_owns_r) begin
+                $display(">>> HANDOFF: never took the bus"); ho_err = ho_err + 1;
+            end
+            repeat (50_000) @(posedge clk);          // 500us 独占
+            if (dut.sd_sec_read || sd_mux_read) begin
+                $display(">>> HANDOFF: BMP still drives SD during video own");
+                ho_err = ho_err + 1;
+            end
+            if (!dut.load_busy) begin
+                $display(">>> HANDOFF: load ended during video own"); ho_err = ho_err + 1;
+            end
+            @(negedge clk);
+            vp = 0;
+            repeat (8) @(posedge clk);
+            if (dut.egv_owns_r) begin
+                $display(">>> HANDOFF: no release after vp low"); ho_err = ho_err + 1;
+            end
+            k = 0;
+            while ((dut.load_busy || dut.swap_pending) && k < 40_000_000) begin
+                @(posedge clk); k = k + 1;
+            end
+            repeat (20) @(posedge clk);
+            if (dut.load_busy || dut.swap_pending) begin
+                $display(">>> HANDOFF: load did not resume (state=%0d)",
+                         dut.bmp_read_m0.state);
+                ho_err = ho_err + 1;
+            end
+            if (abort_cnt != 0) begin
+                $display(">>> HANDOFF: load was aborted %0d time(s)", abort_cnt);
+                ho_err = ho_err + 1;
+            end
+            if (o_src_w_bcd !== bcd16(img_w[dut.img_idx]) ||
+                o_src_h_bcd !== bcd16(img_h[dut.img_idx])) begin
+                $display(">>> HANDOFF: image size mismatch idx=%0d", dut.img_idx);
+                ho_err = ho_err + 1;
+            end
+            $display("HANDOFF: done errors=%0d (t=%0t)", ho_err, $time);
+            errors = errors + ho_err;
+        end
+    endtask
+
     initial begin
         for (i = 0; i < 16; i = i + 1) begin
             img_start[i] = 0; img_bytes[i] = 0; img_w[i] = 0; img_h[i] = 0;
@@ -387,6 +467,8 @@ module tb_bmp_cycle;
 
         $display("CAROUSEL: %0d transitions, shown=%02x, errors=%0d",
                  carousel_cnt, shown_bcd[7:0], errors);
+        video_handoff_test;
+        $display("FINAL: errors=%0d", errors);
         if (drop_hits != 0) $display("DROP injected %0d times", drop_hits);
         if (errors == 0) $display(">>> OK: scan + %0d transitions, no hang", carousel_cnt);
         else             $display(">>> BUG: %0d errors", errors);
@@ -394,15 +476,6 @@ module tb_bmp_cycle;
     end
 
     // ---------------- 行为级 sd_card_top ----------------
-    reg         be_busy = 0;
-    reg  [31:0] be_addr = 0;
-    integer     be_idx = 0;
-    reg  [3:0]  be_startup = 0;
-    reg  [1:0]  be_cool = 0;
-
-    wire        sd_mux_read = dut.sd_sec_read_mux;
-    wire [31:0] sd_mux_addr = dut.sd_sec_addr_mux;
-
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             be_busy <= 1'b0; be_idx <= 0; be_startup <= 0; be_cool <= 0;
@@ -446,8 +519,10 @@ module tb_bmp_cycle;
     end
 
     always @(posedge clk) begin
-        if (!rst && dut.load_abort)
+        if (!rst && dut.load_abort) begin
+            abort_cnt = abort_cnt + 1;
             $display("  [dut] load_abort idx=%0d (t=%0t)", dut.load_idx, $time);
+        end
         if (!rst && dut.wav_grant_timeout)
             $display("  [dut] WAV grant watchdog fired (t=%0t)", $time);
     end
@@ -472,6 +547,7 @@ module sd_card_top
     output           sd_init_done,
     input            sd_sec_read,
     input[31:0]      sd_sec_read_addr,
+    input[15:0]      sd_sec_read_count,   // BMP/WAV 客户端恒为 1，模型按单扇区处理
     output[7:0]      sd_sec_read_data,
     output           sd_sec_read_data_valid,
     output           sd_sec_read_end,

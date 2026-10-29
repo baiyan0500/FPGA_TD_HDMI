@@ -10,6 +10,7 @@ module sd_card_cmd(
 	input[7:0]                  cmd_r1,                       //SD card expect response
 	input[15:0]                 cmd_data_len,                 //SD card command read data length
 	input                       block_read_req,               //SD card sector data read request
+	input[15:0]                 block_read_secs,              //连续读扇区数（CMD18 流式读；1=单扇区）
 	output reg                  block_read_valid,             //SD card sector data read data valid
 	output reg[7:0]             block_read_data,              //SD card sector data read data
 	output                      block_read_req_ack,           //SD card sector data read response
@@ -49,6 +50,7 @@ reg[15:0]                     byte_cnt;
 reg[7:0]                      send_data;
 wire[7:0]                     data_recv;
 reg[9:0]                      wr_data_cnt;
+reg[15:0]                     sec_left;          //本批剩余扇区数（不含当前扇区）
 
 assign cmd_req_ack = (state == S_END);
 assign block_read_req_ack = (state == S_READ_ACK);
@@ -69,6 +71,7 @@ begin
 		state <= S_IDLE;
 		cmd_req_error <= 1'b0;
 		wr_data_cnt <= 10'd0;
+		sec_left <= 16'd0;
 	end
 	else
 		case(state)
@@ -107,7 +110,11 @@ begin
 				if(cmd_req == 1'b1)
 					state <= S_CMD_PRE;
 				else if(block_read_req == 1'b1)
-					state <= S_READ_WAIT;
+				begin
+					// 单条 CMD18 连续读多个扇区；扇区数在请求时锁存
+					sec_left <= (block_read_secs <= 16'd1) ? 16'd0 : (block_read_secs - 16'd1);
+					state    <= S_READ_WAIT;
+				end
 				else if(block_write_req == 1'b1)
 					state <= S_WRITE_TOKEN;
 				clk_div <= spi_clk_div;
@@ -224,6 +231,7 @@ begin
 			begin
 				if(spi_wr_ack == 1'b1)
 				begin
+					// 512 数据 + 2 字节 CRC 全部吃掉，保证 CMD18 下一块 token 对齐
 					if(byte_cnt == 16'd513)
 					begin
 						state <= S_READ_ACK;
@@ -334,7 +342,23 @@ begin
 				state <= S_END;
 				cmd_req_error <= 1'b1;
 			end
-			S_READ_ACK,S_WRITE_ACK,S_END:
+			S_READ_ACK:
+			begin
+				// 流式读：还有扇区就继续等下一个 token（不再发命令）
+				if(sec_left != 16'd0)
+				begin
+					sec_left  <= sec_left - 16'd1;
+					byte_cnt  <= 16'd0;
+					state     <= S_READ_WAIT;
+				end
+				else
+				begin
+					// 流结束：抬 CS 终止 CMD18 连续读，下一命令前的哑字节提供恢复时钟
+					CS_reg <= 1'b1;
+					state  <= S_WAIT;
+				end
+			end
+			S_WRITE_ACK,S_END:
 			begin
 				state <= S_WAIT;
 			end

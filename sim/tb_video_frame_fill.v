@@ -22,7 +22,7 @@ module tb_video_frame_fill;
     wire [31:0] wr_data;
     wire [20:0] wr_len;
     wire        wr_bank, addr_full;
-    wire        disp_bank, ready, busy, frame_end;
+    wire        disp_bank, ready, busy, frame_end, frame_ready;
 
     video_frame_fill #(
         .SRC_W(SW), .SRC_H(SH),
@@ -34,7 +34,7 @@ module tb_video_frame_fill;
         .o_wr_data(wr_data), .o_wr_len(wr_len), .o_wr_bank(wr_bank),
         .o_addr_full(addr_full), .i_fin_tgl(fin_tgl),
         .o_disp_bank(disp_bank), .o_ready(ready), .o_busy(busy),
-        .o_frame_end(frame_end)
+        .o_frame_end(frame_end), .o_frame_ready(frame_ready)
     );
 
     always #5 clk = ~clk;
@@ -84,6 +84,14 @@ module tb_video_frame_fill;
         if (ready && !busy) fb_seen = 1;
     end
 
+    // frame_ready 语义：只在 E_IDLE 为高；初始化未完成/正在写帧时必须为低，
+    // 读端靠它避免在填充未结束时发起下一帧（bug2 丢帧根因）
+    integer rdy_err = 0;
+    always @(posedge clk) begin
+        if (!rst && frame_ready && (busy || !ready))
+            rdy_err = rdy_err + 1;
+    end
+
     // ---- 像素激励：按源行低 8 位 + 列 组成 16bit，行 0 用棋盘便于查横向复制 ----
     task send_row(input integer r);
         integer c;
@@ -107,6 +115,11 @@ module tb_video_frame_fill;
             frame_start <= 1'b1;
             @(posedge clk);
             frame_start <= 1'b0;
+            repeat (3) @(posedge clk);
+            if (frame_ready !== 1'b0) begin
+                $display("FAIL frame_ready high during fill");
+                rdy_err = rdy_err + 1;
+            end
             for (r = 0; r < SH; r = r + 1) send_row(r);
         end
     endtask
@@ -140,6 +153,9 @@ module tb_video_frame_fill;
         end
         if (nz_cnt != 0) begin $display("FAIL init not zero"); errs = errs + 1; end
         if (busy !== 1'b0) begin $display("FAIL busy after init"); errs = errs + 1; end
+        if (frame_ready !== 1'b1) begin
+            $display("FAIL frame_ready not high when idle"); errs = errs + 1;
+        end
 
         // ---------- 第一帧 ----------
         send_frame;
@@ -214,8 +230,8 @@ module tb_video_frame_fill;
         end
         if (busy !== 1'b0) begin $display("FAIL stayed busy"); errs = errs + 1; end
 
-        if (errs == 0) $display("TB_VFF PASS");
-        else           $display("TB_VFF FAIL %0d", errs);
+        if (errs == 0 && rdy_err == 0) $display("TB_VFF PASS");
+        else $display("TB_VFF FAIL %0d rdy_err=%0d", errs, rdy_err);
         $finish;
     end
 

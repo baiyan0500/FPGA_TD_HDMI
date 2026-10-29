@@ -54,6 +54,7 @@ module sd_card_bmp #(
     input                       i_video_play,     // 视频模式：BMP 装载停、WAV 让出总线
     input                       i_egv_sd_read,
     input  [31:0]               i_egv_sd_addr,
+    input  [15:0]               i_egv_sd_count,   //视频客户端连续读扇区数
     output                      o_cli_data_valid,
     output [7:0]                o_cli_data,
     output                      o_cli_read_end,
@@ -99,14 +100,44 @@ reg  [1:0]       wav_pause_sync;
 reg              grant_wav;
 reg              bmp_rd_busy;
 reg              wav_rd_busy;
-wire             want_wav = wav_bus_req && !i_video_play;
-wire             egv_owns = i_video_play;
-wire             bmp_data_valid_g = !grant_wav && !egv_owns && sd_sec_read_data_valid;
-wire             bmp_read_end_g   = !grant_wav && !egv_owns && sd_sec_read_end;
+// 视频独占请求（模式电平）与"当前总线实际归属视频"必须分开：
+// i_video_play 由 video_frame_fill 的组合状态给出，可在扇区中途拉高。
+// 若直接用它切换读请求/数据口，视频客户端会先收到 BMP 在途扇区的尾部字节，
+// 逐字节计数错位→整段视频图像错位、音频错乱。因此与 WAV 一样只在扇区边界交接。
+wire             egv_req = i_video_play;
+reg              egv_owns_r;
+wire             want_wav = wav_bus_req && !egv_req && !egv_owns_r;
+wire             egv_owns = egv_owns_r;
+// 扇区边界：BMP/WAV 均无在途扇区、无挂起请求、WAV 未被授予
+wire             bus_idle = !bmp_rd_busy && !sd_sec_read && !grant_wav &&
+                            !wav_rd_busy && !wav_sd_read;
+// BMP 数据/有效/结束再寄存一级：归属判决（grant_wav 扇出 62、egv_owns）
+// 与 bmp_read 的字节计数 CE 之间必须隔触发器，
+// 否则该锥形链 10.9ns 直接成为 setup 最差路径。
+reg  [7:0]       bmp_d_q;
+reg              bmp_v_q;
+reg              bmp_e_q;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        bmp_d_q <= 8'd0;
+        bmp_v_q <= 1'b0;
+        bmp_e_q <= 1'b0;
+    end else begin
+        bmp_d_q <= sd_sec_read_data;
+        bmp_v_q <= !grant_wav && !egv_owns && sd_sec_read_data_valid;
+        bmp_e_q <= !grant_wav && !egv_owns && sd_sec_read_end;
+    end
+end
+
+wire             bmp_data_valid_g = bmp_v_q;
+wire             bmp_read_end_g   = bmp_e_q;
 wire             sd_sec_read_mux  = grant_wav ? wav_sd_read :
                                     (egv_owns ? i_egv_sd_read : sd_sec_read);
 wire [31:0]      sd_sec_addr_mux  = grant_wav ? wav_sd_addr :
                                     (egv_owns ? i_egv_sd_addr : sd_sec_read_addr);
+// BMP / WAV 客户端仍按单扇区读（CMD17），只有视频客户端用 CMD18 连续读
+wire [15:0]      sd_sec_count_mux = egv_owns ? i_egv_sd_count : 16'd1;
 // WAV 客户端数据/结束信号按 grant 门控分发（此前缺失驱动导致 wav_rd_busy 永不清零、总线锁死）
 assign wav_data_valid = grant_wav && sd_sec_read_data_valid;
 assign wav_read_end   = grant_wav && sd_sec_read_end;
@@ -115,6 +146,8 @@ assign o_cli_data_valid = !grant_wav && egv_owns && sd_sec_read_data_valid;
 assign o_cli_data       = sd_sec_read_data;
 assign o_cli_read_end   = !grant_wav && egv_owns && sd_sec_read_end;
 
+reg              vp_q;                 // i_video_play 寄存一级：起点从 st 组合输出挪到触发器，
+                                       // 否则 vf_busy→i_video_play→装载判决链 10.9ns 违例
 reg              scan_start_pulse;
 reg              load_start_pulse;
 reg [31:0]       load_sector;
@@ -281,6 +314,7 @@ always @(posedge clk or posedge rst) begin
         grant_wav    <= 1'b0;
         bmp_rd_busy  <= 1'b0;
         wav_rd_busy  <= 1'b0;
+        egv_owns_r   <= 1'b0;
         wav_grant_cnt <= 18'd0;
         bmp_busy_cnt <= 18'd0;
     end else begin
@@ -297,11 +331,11 @@ always @(posedge clk or posedge rst) begin
             bmp_busy_cnt <= bmp_busy_cnt + 18'd1;
 
         // bmp 侧在途跟踪
-        if (!grant_wav && !bmp_rd_busy && sd_sec_read)
+        if (!grant_wav && !egv_owns_r && !bmp_rd_busy && sd_sec_read)
             bmp_rd_busy <= 1'b1;
-        else if (!grant_wav && bmp_read_end_g)
+        else if (!grant_wav && !egv_owns_r && bmp_read_end_g)
             bmp_rd_busy <= 1'b0;
-        else if (!grant_wav && bmp_busy_timeout)
+        else if (!grant_wav && !egv_owns_r && bmp_busy_timeout)
             bmp_rd_busy <= 1'b0;    // 卡死：清在途标志，让 WAV 能拿到总线
 
         // wav 侧在途跟踪
@@ -309,6 +343,14 @@ always @(posedge clk or posedge rst) begin
             wav_rd_busy <= 1'b1;
         else if (grant_wav && wav_read_end)
             wav_rd_busy <= 1'b0;
+
+        // 视频独占交接：只在扇区边界接管，离开时等当前 CMD18 批次结束
+        if (!egv_owns_r) begin
+            if (egv_req && bus_idle)
+                egv_owns_r <= 1'b1;
+        end else if (!egv_req && !i_egv_sd_read) begin
+            egv_owns_r <= 1'b0;
+        end
 
         // 总线授予切换
         if (!grant_wav && want_wav && !bmp_rd_busy && !sd_sec_read) begin
@@ -389,6 +431,13 @@ always @(posedge clk or posedge rst) begin
         cand_buf    <= next_buf_lut(disp_buf_idx, display_valid);
         cand_idle   <= {cand_idle[1:0], ~load_busy};
     end
+end
+
+// 视频播放为秒级准静态模式，装载判决用寄存值：发出请求的历史分支都在
+// 视频起播后至少 1 拍才关闭，期间 bmp_read 仍由 i_stall（未寄存）立即拦住
+always @(posedge clk or posedge rst) begin
+    if (rst) vp_q <= 1'b0;
+    else     vp_q <= i_video_play;
 end
 
 always @(posedge clk or posedge rst) begin
@@ -638,7 +687,7 @@ always @(posedge clk or posedge rst) begin
                 end
 
                 // 首图自动加载到 buffer0（若首图坏则沿 fail 链继续尝试后续图片）
-                if (scan_done && !first_image_committed && bmp_ready && !load_busy && !i_video_play && (img_found_count != 5'd0) && cand_ok) begin
+                if (scan_done && !first_image_committed && bmp_ready && !load_busy && !vp_q && (img_found_count != 5'd0) && cand_ok) begin
                     load_idx         <= fail_valid ? cand_idx : 4'd0;
                     load_sector      <= fail_valid ? cand_sector : {14'd0, img_sector0};
                     pending_buf_idx  <= 2'd0;
@@ -654,7 +703,7 @@ always @(posedge clk or posedge rst) begin
                     auto_cnt         <= 32'd0;
                 end
                 // 手动下一张优先：写到“非当前显示”的另一块 buffer
-                else if (scan_done && bmp_ready && display_valid && !load_busy && !i_video_play && next_req_pending && (img_found_count != 5'd0) && cand_ok) begin
+                else if (scan_done && bmp_ready && display_valid && !load_busy && !vp_q && next_req_pending && (img_found_count != 5'd0) && cand_ok) begin
                     load_idx         <= cand_idx;
                     load_sector      <= cand_sector;
                     pending_buf_idx  <= cand_buf;
@@ -670,7 +719,7 @@ always @(posedge clk or posedge rst) begin
                     auto_cnt         <= 32'd0;
                 end
                 // 自动播放下一张：同样写到“非当前显示”的另一块 buffer
-                else if (scan_done && bmp_ready && display_valid && !load_busy && !i_video_play && auto_play_en && auto_tick && (img_found_count > 5'd1) && cand_ok) begin
+                else if (scan_done && bmp_ready && display_valid && !load_busy && !vp_q && auto_play_en && auto_tick && (img_found_count > 5'd1) && cand_ok) begin
                     load_idx         <= cand_idx;
                     load_sector      <= cand_sector;
                     pending_buf_idx  <= cand_buf;
@@ -717,14 +766,14 @@ bmp_read bmp_read_m0(
     .write_req_ack          (write_req_ack_s),
     .sd_sec_read            (sd_sec_read),
     .sd_sec_read_addr       (sd_sec_read_addr),
-    .sd_sec_read_data       (sd_sec_read_data),
+    .sd_sec_read_data       (bmp_d_q),
     .sd_sec_read_data_valid (bmp_data_valid_g),
     .sd_sec_read_end        (bmp_read_end_g),
     .bmp_data_wr_en         (bmp_data_wr_en),
     .bmp_data               (bmp_data),
     .src_width              (src_width),
     .src_height             (src_height),
-    .i_stall                (scale_almost_full | want_wav | i_video_play)
+    .i_stall                (scale_almost_full | want_wav | i_video_play | egv_owns_r)
 );
 
 scaler u_scaler(
@@ -751,6 +800,7 @@ sd_card_top sd_card_top_m0(
     .sd_init_done           (sd_init_done),
     .sd_sec_read            (sd_sec_read_mux),
     .sd_sec_read_addr       (sd_sec_addr_mux),
+    .sd_sec_read_count      (sd_sec_count_mux),
     .sd_sec_read_data       (sd_sec_read_data),
     .sd_sec_read_data_valid (sd_sec_read_data_valid),
     .sd_sec_read_end        (sd_sec_read_end),

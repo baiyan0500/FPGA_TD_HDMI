@@ -62,8 +62,9 @@ src/td_project/HDMI1.4b_Transmitter_v1.0.al
 ## 当前状态（2026-10-29）
 
 - 功能：基础 4/4、扩展 5/5 均已实现；本轮新增三层按键重规划、视频播放、弹幕、资源面板
-- 官方布局布线：Multi-Seed seed 2 完成，Setup +557ps / Hold +21ps / 0 FEPs，LUT 14057（71.72%）、8385 slices（85.56%）、54 RAM、19 DSP
-- bit：`HDMI1.4b_Transmitter_v1.0_video_seed2_setup557_hold21.bit`，见 `../bitstream/README.md`；待上板回归
+- 上板修复：WAV 头解析（卡内文件 fmt 后带 LIST 块，data 偏移 70 非 4 字节对齐）、视频客户端改扇区边界独占 + CMD18 连续读、`egv_reader` 段计数器 16→20 位（旧值把 385,024 扇区的 run1 饱和成 16,384）
+- 官方布局布线：Multi-Seed seed 3 完成，Setup +363ps / Hold +21ps / 0 FEPs，LUT 14491（73.93%）、8528 slices（87.02%）、54 RAM、19 DSP
+- bit：`HDMI1.4b_Transmitter_v1.0_avfix2_seed3_setup363_hold21.bit`，见 `../bitstream/README.md`；待上板回归
 - 剩余：上板验证、演示收尾
 
 ## 文档索引
