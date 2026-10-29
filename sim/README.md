@@ -20,7 +20,7 @@
 | `tb_spectrum.v` | `audio_spectrum` | 1kHz 频段定位 |
 | `tb_font.v` | `font8x8` | 小写字形非零 |
 | `tb_bmp_cycle.v` | `sd_card_bmp` 整链 | 16 图扫描 + 9 图连续轮播 + WAV 总线竞争无死锁 + 视频独占扇区边界交接（中途请求独占必须等扇区结束，装载不丢字节、不触发看门狗）；`+START=<扇区>` 模拟大元数据区（exFAT）、`+DROP=<sector>` 注入丢请求验证看门狗恢复 |
-| `tb_sd_timing.v` | `sd_card_top`（真实 SPI 模式 3 卡模型） | CMD17/CMD18 扇区读：逐字节数据与扇区计数校验、吞吐统计（CMD18 约 185.7µs/扇区 → 201 扇区/帧 37.3ms）、CMD18 批次后立即恢复单扇区读；`+N=<扇区数>` 调整批量 |
+| `tb_sd_timing.v` | `sd_card_top`（真实 SPI 模式 3 卡模型） | CMD17/CMD18 扇区读：逐字节数据与扇区计数校验、吞吐统计（CMD18 约 185.7µs/扇区 → 201 扇区/帧 37.3ms）、CMD18 批次后立即恢复单扇区读；`+N=<扇区数>` 调整批量，`+LAG=<n>` 客户端地址滞后拍数（默认 1 = 等价 `bmp_read` 的两级结束寄存，0 = 理想客户端），`+DROP=<n>` 叠加 ST_SCAN 式撤一拍请求 |
 | `tb_egv_reader.v` | `egv_reader` | 段表跨段换算、视频/音频字节拆分、末帧停机与重启；连跑 90 帧（越过 16,600 扇区）逐扇区校验地址与批大小，覆盖 16bit 段计数器溢出回归（需 `+incdir+.../video`） |
 | `tb_video_frame_fill.v` | `video_frame_fill` | 2 倍放大、296 行写入、双 bank 切换与首帧初始化（依赖 `eg_logic_bram_sim.v`） |
 | `tb_egv_audio_fifo.v` | `egv_audio_fifo` | 字节流重排为 s16 立体声、FWFT 读、flush |
@@ -73,6 +73,8 @@ vsim -c -do "run -all; quit" work.tb_bmp_cycle \
 >
 > 同日修 bug（WAV 头 LIST 块、视频扇区边界交接、读核输出流水）后重跑：`tb_wav_path` 6 组全 PASS、`tb_bmp_cycle` 12 次切换 + 交接 `errors=0`、`tb_sd_timing` 逐字节 PASS（CMD18 185.68µs/扇区）、`tb_egv_reader` / `tb_video_frame_fill` PASS。
 > 同日再修 `egv_reader` 段计数器位宽（16→20）后复跑 `tb_egv_reader`：`addr_err=0 cnt_err=0 pix_err=0 aud_err=0 eof_err=0 gate_err=0 frames=90` PASS。
+>
+> 2026-10-29 读核地址锁存修复：`tb_sd_timing` 原来在同一拍跟着 `sec_end` 改地址，比真实 `bmp_read` 早一拍，测不出缺陷；新增 `+LAG=1`（默认）后，修复前的 RTL 立刻 `FAIL nerr=7168`（`DATA ERR sec=1 i=1 got 01 exp 02`，整段在重读扇区 0），修复后 `+LAG=1` / `+LAG=0` / `+LAG=1 +DROP=1` 三组全 PASS（CMD18 185.77µs/扇区）。同轮 `tb_bmp_cycle`（扫描 + 18 次切换 + 视频独占交接 `errors=0`）、`tb_wav_path` 6 组、`tb_egv_reader`、`tb_video_frame_fill` 全 PASS。
 
 SD 读核（真实 SPI 模式 3 卡模型）：
 

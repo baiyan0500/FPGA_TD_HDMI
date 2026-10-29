@@ -1,0 +1,78 @@
+-----------------------------------------------------------
+| QoR metrics               |         value               |
+-----------------------------------------------------------
+| Timing                    |                             |
+|     Setup WNS             |         -296                |
+|     Setup TNS             |         -296                |
+|     Num of violated S-EP  |            1                |
+|     Hold WNS              |          471                |
+|     Hold TNS              |            0                |
+|     Num of violated H-EP  |            0                |
+-----------------------------------------------------------
+| Utilization               |                             |
+|     #registers            |         8520                |
+|     #luts                 |         9010                |
+|     #lut1                 |           73                |
+|     #lut1(~A)             |           73                |
+|     #slices               |         2753                |
+|     slices percentage     |       28.09%                |
+|     #RAMs                 |           54                |
+|     #DSPs                 |           19                |
+|     #f7mux                |        0.00%                |
+|     #MACROs               |          549                |
+|     #insts in MACRO       |         2753                |
+-----------------------------------------------------------
+| kept_net                  |                             |
+|     #syn_keep             |          171                |
+|     #keep_hier            |          132                |
+|     #dont_touch           |            0                |
+|     #mark_debug           |            0                |
+|     #max_fanout_keep      |            0                |
+|     #async_reg            |            0                |
+-----------------------------------------------------------
+| Top 10% datanet fanout#   |        42.53                |
+| dff(single fanout)->dff   |         1442                |
+| dff(single fanout)->dram  |            0                |
+-----------------------------------------------------------
+| Over-quota path num*      |                             |
+|     Total                 |            0                |
+-----------------------------------------------------------
+| Rent**                    |                             |
+-----------------------------------------------------------
+Note*: Over-quota path shows the over-path-level-threshold path number of each clock.
+       The clock will not be shown if no path is with path level over the threshold.
+       The threshold is defined as worst path_margin / 800ps.
+Note**: Rent shows the rent exponent value of the modules whose rent value exceeds the threshold.
+        Only modules under top are reported, and the threshold is defined as 0.7.
+
+Logic Level Distribution
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  Clock                         |  Period             |  0     |  1     |  2     |  3     |  4     |  5     |  6    |  7    |  8   |  9   |  10  |  29   |  >=30
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  audio_mclk                    |  81.334ns (12MHz)   |  456   |  365   |  138   |  105   |  102   |  1     |  71   |  37   |  6   |  26  |  0   |  0    |  48
+  clk                           |  20.000ns (50MHz)   |  885   |  32    |  17    |  382   |  81    |  7     |  152  |  112  |  0   |  0   |  0   |  0    |  48
+  ext_mem_clk                   |  8.000ns (125MHz)   |  793   |  180   |  110   |  85    |  26    |  17    |  10   |  0    |  0   |  0   |  0   |  0    |  48
+  hdmi_5x_clk                   |  8.000ns (125MHz)   |  16    |  33    |  0     |  0     |  0     |  0     |  0    |  0    |  0   |  0   |  0   |  0    |  48
+  sd_card_clk                   |  10.000ns (100MHz)  |  3264  |  732   |  778   |  642   |  798   |  624   |  218  |  207  |  24  |  0   |  0   |  0    |  48
+  sys_pll_m0/pll_inst.clkc[2]   |  8.000ns (125MHz)   |  0     |  0     |  0     |  0     |  0     |  0     |  0    |  0    |  0   |  0   |  0   |  0    |  48
+  u_audio_pll/pll_inst.clkc[0]  |  13.333ns (75MHz)   |  0     |  0     |  0     |  0     |  0     |  0     |  0    |  0    |  0   |  0   |  0   |  0    |  48
+  video_clk                     |  40.000ns (25MHz)   |  2085  |  1272  |  646   |  696   |  703   |  611   |  51   |  6    |  32  |  25  |  1   |  160  |  48
+  Total                         |  NA                 |  7499  |  2614  |  1689  |  1910  |  1710  |  1260  |  502  |  362  |  62  |  51  |  1   |  160  |  48
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Hierarchical Rent Exponent Report
++---------------------------------------------------------------------------------------------------------------------+
+|Inst                                   |Model                                 |Rent     |Cell     |Pin     |Term     |
++---------------------------------------------------------------------------------------------------------------------+
+|top                                    |top                                   |0.15     |20926    |87620   |19       |
+|  u_osd_layer                          |osd_layer_17                          |0.59     |5540     |24300   |703      |
+|  u_hdmi_1_4b_transmitter_core_wrapper |hdmi_1_4b_transmitter_core_wrapper_15 |0.58     |2951     |10636   |360      |
+|  frame_read_write_m0                  |frame_read_write_2                    |0.57     |1046     |3808    |188      |
+|  u_audio_spectrum                     |audio_spectrum_9                      |0.52     |1100     |5199    |179      |
+|  sd_card_bmp_m0                       |sd_card_bmp_3                         |0.47     |5022     |21876   |231      |
++---------------------------------------------------------------------------------------------------------------------+
+Note: Cell represents total number of cells inside module; Pin represents total number of pins
+      which have net connection inside module; Term represents total number of PIs and POs of module.
+      Rent represents the relationship between number of terms and number of cells in module.
+      A module with higher rent corresponds to highly connected logic and strong connectivity with others.
+Report gate stage QoR done.
+

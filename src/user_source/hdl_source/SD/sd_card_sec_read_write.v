@@ -54,7 +54,15 @@ localparam S_READ_END           = 16;
 localparam S_WAIT_READ_WRITE    = 17;
 localparam S_CMD16              = 18;
 localparam S_CMD18              = 19;
-localparam S_READ_WAIT          = 20;   // 读端多等一拍：结束脉冲晚一拍后，客户端仍有时间更新地址
+localparam S_READ_WAIT          = 20;   // 结束脉冲之后先空等两拍（S_READ_WAIT/S_READ_WAIT2），
+                                        // 让客户端有时间把地址更新到 sd_sec_read_addr
+// 结束脉冲到客户端的路径：sec_end_pulse → rd_end_q（本文件）→ bmp_e_q（sd_card_bmp）
+// 共 2 级寄存，客户端因此在 sec_end_pulse 之后第 3 拍才更新地址并在同一拍撤销
+// sd_sec_read。寄一拍不够：核心仍在第 2 拍就把老地址锁进 sec_addr，于是每个扇区
+// 都重发上一条 CMD17（扫描永远停在扇区 0，装载/视频全部拿不到数据）。
+// 再补一拍，核心在客户端撤销那一拍先看到 sd_sec_read=0 不锁存，
+// 下一拍才在"请求已恢复、地址已更新"的状态下取地址。
+localparam S_READ_WAIT2         = 21;
 
 reg[4:0]                       state;
 reg[31:0]                      sec_addr;
@@ -298,6 +306,10 @@ begin
 				state <= S_READ_WAIT;
 			end
 			S_READ_WAIT:
+			begin
+				state <= S_READ_WAIT2;
+			end
+			S_READ_WAIT2:
 			begin
 				state <= S_WAIT_READ_WRITE;
 			end

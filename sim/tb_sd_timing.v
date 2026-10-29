@@ -13,6 +13,9 @@
 // 参数：
 //   +N=<n>     每个测试的扇区数（默认 64）
 //   +LAT=<n>   token 前插入的哑字节数（模拟卡内读延迟，默认 40）
+//   +LAG=<n>  客户端地址更新相对 sec_end 的滞后拍数（默认 1 = 等价 bmp_read，
+//             其结束脉冲多一级 bmp_e_q；0 = 理想客户端）
+//   +DROP=<n>  非 0 时再叠加 ST_SCAN 式的"结束当拍撤一拍 sd_sec_read"
 //   +DBG=<n>   1 打印收发字节，2 打印每次命令
 // ============================================================================
 `timescale 1ns/1ps
@@ -23,9 +26,11 @@ module tb_sd_timing;
     reg  rst = 1'b1;
     always #5 clk = ~clk;           // 100MHz
 
-    reg         sec_read = 1'b0;
     reg  [31:0] sec_addr = 32'd0;
     reg  [15:0] sec_count = 16'd1;
+    reg         rd_window = 1'b0;         // 测试窗口：允许持续读
+    reg         cli_drop  = 1'b0;         // 模拟 ST_SCAN 在结束当拍撤一拍请求
+    wire        sec_read  = rd_window && !cli_drop;
     wire [7:0]  sec_data;
     wire        sec_dv;
     wire        sec_end;
@@ -247,11 +252,43 @@ module tb_sd_timing;
         end
     end
 
-    // 单扇区模式：每读完一个扇区地址 +1（在 read_end 当拍更新，
-    // 控制器两个周期后才在 S_WAIT_READ_WRITE 锁存新地址）
-    always @(posedge clk)
-        if (!rst && sec_end && sec_count == 16'd1)
-            sec_addr <= sec_addr + 32'd1;
+    // ------------------------------------------------------------------
+    // 单扇区客户端模型（复现 bmp_read 的真实时序）
+    //   真实链路里 sec_end 到 bmp_read 还多一级 bmp_e_q 寄存，而且 ST_LOAD_DATA
+    //   期间 sd_sec_read 一直保持高（只有 ST_SCAN 会在结束当拍撤一拍）。
+    //   所以客户端是在 sec_end 之后第 2 拍才更新地址，而请求始终为高。
+    //     +LAG=0  理想客户端（旧 TB 行为，测不出"地址锁存过早"）
+    //     +LAG=1  等价 bmp_read（默认）：地址晚一拍，请求不撤
+    //     +DROP=1 再叠加 ST_SCAN 式的"结束当拍撤一拍请求"
+    // ------------------------------------------------------------------
+    integer   lag = 1;
+    integer   drop_en = 0;
+    reg [2:0] end_d = 3'd0;
+    reg       cli_end;
+
+    always @(*) begin
+        case (lag)
+            0:       cli_end = sec_end;
+            1:       cli_end = end_d[0];
+            2:       cli_end = end_d[1];
+            default: cli_end = end_d[2];
+        endcase
+    end
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            end_d    <= 3'd0;
+            cli_drop <= 1'b0;
+            sec_addr <= 32'd0;
+        end else begin
+            end_d <= {end_d[1:0], sec_end};
+            if (cli_end && sec_count == 16'd1) begin
+                sec_addr <= sec_addr + 32'd1;
+                cli_drop <= (drop_en != 0);
+            end else
+                cli_drop <= 1'b0;
+        end
+    end
 
     // ------------------------------------------------------------------
     // 激励与吞吐统计
@@ -269,12 +306,12 @@ module tb_sd_timing;
             @(negedge clk);
             sec_addr  = a;
             sec_count = cnt[15:0];
-            sec_read  = 1'b1;
+            rd_window = 1'b1;
             tstart    = $time;
             while (nend < n) @(posedge clk);
             telapsed  = $time;
             @(negedge clk);
-            sec_read  = 1'b0;
+            rd_window = 1'b0;
             repeat (20) @(posedge clk);
         end
     endtask
@@ -294,6 +331,8 @@ module tb_sd_timing;
     initial begin
         if ($value$plusargs("N=%d", n_sec)) ;
         if ($value$plusargs("LAT=%d", lat)) ;
+        if ($value$plusargs("LAG=%d", lag)) ;
+        if ($value$plusargs("DROP=%d", drop_en)) ;
         if ($value$plusargs("DBG=%d", dbg)) ;
         repeat (20) @(posedge clk);
         rst = 1'b0;
