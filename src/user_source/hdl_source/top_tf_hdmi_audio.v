@@ -131,6 +131,7 @@ wire        vid_load_busy;
 
 wire        egv_sd_read;
 wire [31:0] egv_sd_addr;
+wire [15:0] egv_sd_count;
 wire        egv_cli_dv;
 wire [7:0]  egv_cli_data;
 wire        egv_cli_end;
@@ -152,6 +153,7 @@ wire        vf_wr_bank;
 wire        vf_addr_full;
 wire        vf_disp_bank;
 wire        vf_ready;
+wire        vf_frame_ready;
 wire        vf_busy;
 wire        vf_frame_end;
 reg         vid_ftgl;
@@ -354,6 +356,7 @@ sd_card_bmp #(
     .i_video_play      (vid_wr_own),
     .i_egv_sd_read     (egv_sd_read),
     .i_egv_sd_addr     (egv_sd_addr),
+    .i_egv_sd_count    (egv_sd_count),
     .o_cli_data_valid  (egv_cli_dv),
     .o_cli_data        (egv_cli_data),
     .o_cli_read_end    (egv_cli_end),
@@ -731,9 +734,11 @@ egv_reader #(
     .clk              (sd_card_clk),
     .rst              (rst_all),
     .i_play           (vid_layer & vid_play_w & vf_ready & sd_ready & ~vid_load_busy),
+    .i_fill_ready     (vf_frame_ready),
     .i_sd_ready       (sd_ready),
     .o_sd_read        (egv_sd_read),
     .o_sd_addr        (egv_sd_addr),
+    .o_sd_count       (egv_sd_count),
     .i_sd_data        (egv_cli_data),
     .i_sd_data_valid  (egv_cli_dv),
     .i_sd_read_end    (egv_cli_end),
@@ -764,6 +769,7 @@ video_frame_fill u_video_frame_fill (
     .i_fin_tgl        (frame_write_toggle_mem),
     .o_disp_bank      (vf_disp_bank),
     .o_ready          (vf_ready),
+    .o_frame_ready    (vf_frame_ready),
     .o_busy           (vf_busy),
     .o_frame_end      (vf_frame_end)
 );

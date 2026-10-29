@@ -6,7 +6,7 @@
 
 | 测试平台 | DUT | 验证重点 |
 |---|---|---|
-| `tb_wav_path.v` | `sd_card_wav` + `wav_i2s_source` | 扇区连续、FIFO 不溢出、ASRC 速率、无丢字/重字 |
+| `tb_wav_path.v` | `sd_card_wav` + `wav_i2s_source` | 扇区连续、FIFO 不溢出、ASRC 速率、无丢字/重字；`+HDR=0/1/2` 覆盖标准头、fmt 后带 LIST/INFO（data 非 4 字节对齐）、奇数 chunk 带填充 |
 | `tb_bmp_stride.v` | `bmp_read` | 行尾对齐填充、宽高保护、提前结束 |
 | `tb_scaler.v` / `tb_scaler2.v` / `tb_scaler3.v` | `scaler` | 放大、缩小、1:1 |
 | `tb_bmp_scaler.v` | `bmp_read` + `scaler` | 整帧装载：源帧被完整消费（`ready` 回 1）、输出 307200 像素；`+BMP=<路径>` 指定图片 |
@@ -19,8 +19,9 @@
 | `tb_slogan.v` | `slogan_ctrl` | UART 行解析 |
 | `tb_spectrum.v` | `audio_spectrum` | 1kHz 频段定位 |
 | `tb_font.v` | `font8x8` | 小写字形非零 |
-| `tb_bmp_cycle.v` | `sd_card_bmp` 整链 | 16 图扫描 + 9 图连续轮播 + WAV 总线竞争无死锁；`+START=<扇区>` 模拟大元数据区（exFAT）、`+DROP=<sector>` 注入丢请求验证看门狗恢复 |
-| `tb_egv_reader.v` | `egv_reader` | 段表跨段换算、视频/音频字节拆分、末帧停机与重启（需 `+incdir+.../video`） |
+| `tb_bmp_cycle.v` | `sd_card_bmp` 整链 | 16 图扫描 + 9 图连续轮播 + WAV 总线竞争无死锁 + 视频独占扇区边界交接（中途请求独占必须等扇区结束，装载不丢字节、不触发看门狗）；`+START=<扇区>` 模拟大元数据区（exFAT）、`+DROP=<sector>` 注入丢请求验证看门狗恢复 |
+| `tb_sd_timing.v` | `sd_card_top`（真实 SPI 模式 3 卡模型） | CMD17/CMD18 扇区读：逐字节数据与扇区计数校验、吞吐统计（CMD18 约 185.7µs/扇区 → 201 扇区/帧 37.3ms）、CMD18 批次后立即恢复单扇区读；`+N=<扇区数>` 调整批量 |
+| `tb_egv_reader.v` | `egv_reader` | 段表跨段换算、视频/音频字节拆分、末帧停机与重启；连跑 90 帧（越过 16,600 扇区）逐扇区校验地址与批大小，覆盖 16bit 段计数器溢出回归（需 `+incdir+.../video`） |
 | `tb_video_frame_fill.v` | `video_frame_fill` | 2 倍放大、296 行写入、双 bank 切换与首帧初始化（依赖 `eg_logic_bram_sim.v`） |
 | `tb_egv_audio_fifo.v` | `egv_audio_fifo` | 字节流重排为 s16 立体声、FWFT 读、flush |
 | `tb_danmaku_osd.v` | `danmaku_osd` | 两轨道排队、逐字变色、滚完才消失 |
@@ -68,7 +69,29 @@ vsim -c -do "run -all; quit" work.tb_bmp_cycle \
 
 注意：`tb_bmp_cycle.v` 末尾自带行为级 `sd_card_top`（同名），编译时不要再加入 `SD/sd_card_top.v`，否则会覆盖模型。`key_press_debounce` 定义在 `SD/sd_card_bmp.v` 内，`tb_ctrl` 需要一并编译。
 
-> 2026-10-29 复跑：`tb_ctrl`、`tb_slogan`、`tb_danmaku_osd`、`tb_resmon_osd`、`tb_video_frame_fill`、`tb_egv_audio_fifo`、`tb_egv_reader`、`tb_osd_layer`、`tb_spectrum`、`tb_bmp_cycle`（6 图 + 12 次切换）全部 PASS。结果记录见 [验证记录](../docs/05-验证记录.md)。
+> 2026-10-29 复跑：`tb_ctrl`、`tb_slogan`、`tb_danmaku_osd`、`tb_resmon_osd`、`tb_video_frame_fill`、`tb_egv_audio_fifo`、`tb_egv_reader`、`tb_osd_layer`、`tb_spectrum`、`tb_bmp_cycle`（6 图 + 12 次切换 + 视频独占交接）、`tb_sd_timing`、`tb_wav_path`（`+HDR=0/1/2` × 单双声道）全部 PASS。结果记录见 [验证记录](../docs/05-验证记录.md)。
+>
+> 同日修 bug（WAV 头 LIST 块、视频扇区边界交接、读核输出流水）后重跑：`tb_wav_path` 6 组全 PASS、`tb_bmp_cycle` 12 次切换 + 交接 `errors=0`、`tb_sd_timing` 逐字节 PASS（CMD18 185.68µs/扇区）、`tb_egv_reader` / `tb_video_frame_fill` PASS。
+> 同日再修 `egv_reader` 段计数器位宽（16→20）后复跑 `tb_egv_reader`：`addr_err=0 cnt_err=0 pix_err=0 aud_err=0 eof_err=0 gate_err=0 frames=90` PASS。
+
+SD 读核（真实 SPI 模式 3 卡模型）：
+
+```bash
+vlog ../src/user_source/hdl_source/SD/spi_master.v \
+     ../src/user_source/hdl_source/SD/sd_card_cmd.v \
+     ../src/user_source/hdl_source/SD/sd_card_sec_read_write.v \
+     ../src/user_source/hdl_source/SD/sd_card_top.v tb_sd_timing.v
+vsim -c -do "run -all; quit" work.tb_sd_timing [+N=<扇区数>]
+```
+
+WAV 头布局回归（`+HDR=0` 标准 44 字节、`+HDR=1` fmt 后带 LIST/INFO、`+HDR=2` 奇数 chunk 带填充字节）：
+
+```bash
+vlog ../src/user_source/hdl_source/SD/sd_card_wav.v \
+     ../src/user_source/hdl_source/wav_i2s_source.v \
+     ../src/user_source/hdl_source/IP/afifo_16_32_256.v tb_wav_path.v
+vsim -c work.tb_wav_path -gSTEREO=0 -do "run -all; quit" +HDR=1
+```
 
 视频相关用例需要额外文件：
 

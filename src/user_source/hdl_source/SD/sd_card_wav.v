@@ -162,8 +162,37 @@ localparam P_RIFF    = 3'd0;   // 文件头 12 字节（RIFF 头结构固定）
 localparam P_ID      = 3'd1;   // chunk id 4 字节
 localparam P_SIZE    = 3'd2;   // chunk size 4 字节
 localparam P_PAYLOAD = 3'd3;   // chunk payload（fmt 字段提取 / 其他跳过）
+localparam P_PAD     = 3'd4;   // 奇数长度 chunk 的字对齐填充字节
 
-wire parse_en = (state == W_HDR) && sd_sec_data_valid;
+// 不能用 pbyte[1:0] 判 chunk 边界：chunk 起点不保证 4 字节对齐
+// （本卡 fmt 16 字节后接 26 字节 LIST，data 从文件偏移 70 开始），
+// 一旦错位就会把 data 的 id 误判成 3 字节 → 找不到 data → 回退测试音。
+// 因此 ID/SIZE 各自用独立计数器；data 找到后冻结解析，避免 payload 被误判。
+reg [1:0] id_cnt;
+reg [1:0] sz_cnt;
+
+// sd_sec_data_valid 由 SD 核 state 组合译码（约 4 级 LUT），若直连 parse_en，
+// 解析寄存器的 CE 形成 10.5ns 长链（SWNS -0.668ns）。头字段字节间隔约 360ns，
+// 解析晚一拍没有任何影响；用 data_last 提前拦住末尾 size 字节，
+// 保证与直连版本逐字节等价（否则会多解析 1 个 payload 字节）。
+reg [7:0] pdata;
+reg       pvalid;
+wire      data_last = (pst == P_SIZE) && (sz_cnt == 2'd3) &&
+                      ({id3, id2, id1, id0} == "data");
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        pdata  <= 8'd0;
+        pvalid <= 1'b0;
+    end else begin
+        pdata  <= sd_sec_data;
+        pvalid <= (state == W_HDR) && sd_sec_data_valid && !data_seen && !data_last;
+    end
+end
+
+wire parse_en = pvalid;
+// 小端 32bit 字段：低字节先到，用右移累加
+wire [31:0] chunk_size_n = {pdata, chunk_size[31:8]};
 
 // fmt_rate 独立装配（4 字节 LE 移位）
 always @(posedge clk or posedge rst) begin
@@ -171,7 +200,7 @@ always @(posedge clk or posedge rst) begin
         fmt_rate <= 32'd0;
     else if (parse_en && (pst == P_PAYLOAD) && !fmt_seen &&
              ({id3, id2, id1, id0} == "fmt ") && (chunk_cofs >= 32'd4) && (chunk_cofs <= 32'd7))
-        fmt_rate <= {sd_sec_data, fmt_rate[31:8]};
+        fmt_rate <= {pdata, fmt_rate[31:8]};
 end
 
 always @(posedge clk or posedge rst) begin
@@ -182,17 +211,18 @@ always @(posedge clk or posedge rst) begin
         id_sr <= 8'd0; wave_ok <= 1'b0; fmt_seen <= 1'b0;
         fmt_format <= 16'd0; fmt_ch <= 16'd0; fmt_bps <= 16'd0;
         data_seen <= 1'b0; data_off <= 32'd0; data_size <= 32'd0;
+        id_cnt <= 2'd0; sz_cnt <= 2'd0;
     end else if (parse_en) begin
         pbyte <= pbyte + 11'd1;
         case (pst)
             P_RIFF: begin
                 case (pbyte[3:0])
                     4'd4, 4'd5, 4'd6, 4'd7:
-                        riff_size <= {sd_sec_data, riff_size[31:8]};
-                    4'd8:  id_sr <= sd_sec_data;                          // 'W'
-                    4'd9:  if (id_sr == "W") id_sr <= sd_sec_data;        // 'A'
-                    4'd10: if (id_sr == "A") id_sr <= sd_sec_data;        // 'V'
-                    4'd11: if (id_sr == "V" && sd_sec_data == "E") wave_ok <= 1'b1;
+                        riff_size <= {pdata, riff_size[31:8]};
+                    4'd8:  id_sr <= pdata;                          // 'W'
+                    4'd9:  if (id_sr == "W") id_sr <= pdata;        // 'A'
+                    4'd10: if (id_sr == "A") id_sr <= pdata;        // 'V'
+                    4'd11: if (id_sr == "V" && pdata == "E") wave_ok <= 1'b1;
                     default: ;
                 endcase
                 if (pbyte == 11'd11)
@@ -200,45 +230,52 @@ always @(posedge clk or posedge rst) begin
             end
 
             P_ID: begin
-                {id3, id2, id1, id0} <= {id2, id1, id0, sd_sec_data};
-                if (pbyte[1:0] == 2'd3)
-                    pst <= P_SIZE;
+                {id3, id2, id1, id0} <= {id2, id1, id0, pdata};
+                id_cnt <= id_cnt + 2'd1;
+                if (id_cnt == 2'd3) begin
+                    id_cnt <= 2'd0;
+                    sz_cnt <= 2'd0;
+                    pst    <= P_SIZE;
+                end
             end
 
             P_SIZE: begin
-                if (pbyte[1:0] == 2'd3) begin
-                    chunk_size <= {sd_sec_data, chunk_size[31:8]};
+                chunk_size <= chunk_size_n;
+                sz_cnt     <= sz_cnt + 2'd1;
+                if (sz_cnt == 2'd3) begin
                     chunk_cofs <= 32'd0;
                     if ({id3, id2, id1, id0} == "data") begin
                         data_seen <= 1'b1;
                         data_off  <= pbyte + 11'd1;   // size 第 4 字节后即 payload 起点
-                        data_size <= {sd_sec_data, chunk_size[31:8]};
+                        data_size <= chunk_size_n;
                     end
-                    pst <= P_PAYLOAD;
-                end else begin
-                    chunk_size <= {sd_sec_data, chunk_size[31:8]};
+                    pst <= (chunk_size_n == 32'd0) ? P_ID : P_PAYLOAD;
                 end
             end
 
             P_PAYLOAD: begin
                 if (!fmt_seen && ({id3, id2, id1, id0} == "fmt ")) begin
                     case (chunk_cofs)
-                        32'd0:  fmt_format <= {fmt_format[15:8], sd_sec_data};
-                        32'd1:  fmt_format <= {sd_sec_data, fmt_format[7:0]};
-                        32'd2:  fmt_ch      <= {fmt_ch[15:8], sd_sec_data};
-                        32'd3:  fmt_ch      <= {sd_sec_data, fmt_ch[7:0]};
-                        32'd14: fmt_bps     <= {fmt_bps[15:8], sd_sec_data};
+                        32'd0:  fmt_format <= {fmt_format[15:8], pdata};
+                        32'd1:  fmt_format <= {pdata, fmt_format[7:0]};
+                        32'd2:  fmt_ch      <= {fmt_ch[15:8], pdata};
+                        32'd3:  fmt_ch      <= {pdata, fmt_ch[7:0]};
+                        32'd14: fmt_bps     <= {fmt_bps[15:8], pdata};
                         32'd15: begin
-                            fmt_bps  <= {sd_sec_data, fmt_bps[7:0]};
+                            fmt_bps  <= {pdata, fmt_bps[7:0]};
                             fmt_seen <= 1'b1;
                         end
                         default: ;
                     endcase
                 end
                 if (chunk_cofs + 32'd1 >= chunk_size)
-                    pst <= P_ID;      // 下一个 chunk
+                    pst <= chunk_size[0] ? P_PAD : P_ID;   // 奇数长度补 1 字节对齐
                 else
                     chunk_cofs <= chunk_cofs + 32'd1;
+            end
+
+            P_PAD: begin
+                pst <= P_ID;
             end
 
             default: pst <= P_RIFF;
@@ -418,13 +455,21 @@ function [11:0] gray2bin;
     end
 endfunction
 wire [11:0] rbin_w  = gray2bin(rgray_w2);
-// 水位计数寄存一拍：gray2bin + 减法链仅到寄存器 D，不再直驱下游比较/RAM 使能
+// gray2bin（11 级 XOR 递推）+ 12bit 减法合在一拍是 SD 域最差 setup 路径（-112ps）；
+// 拆成两级流水：先寄存二进制读指针，再做减法，水位多滞后一拍无影响（补水阈值有余量）
+reg  [11:0] rbin_w_q;
 reg  [11:0] wcount_q;
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        rbin_w_q <= 12'd0;
+    else
+        rbin_w_q <= rbin_w;
+end
 always @(posedge clk or posedge rst) begin
     if (rst)
         wcount_q <= 12'd0;
     else
-        wcount_q <= wbin - rbin_w;
+        wcount_q <= wbin - rbin_w_q;
 end
 assign fifo_count = wcount_q;
 // 判满：写指针下一跳 gray 与同步后读 gray 高 2 位取反比较（无 gray2bin/减法）

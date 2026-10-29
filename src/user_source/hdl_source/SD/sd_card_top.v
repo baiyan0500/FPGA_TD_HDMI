@@ -14,6 +14,7 @@ module sd_card_top
 	output           sd_init_done,              //SD card initialization is complete
 	input            sd_sec_read,               //SD card sector read
 	input[31:0]      sd_sec_read_addr,          //SD card sector read address
+	input[15:0]      sd_sec_read_count,         //连续读扇区数（>1 用 CMD18 流式读）
 	output[7:0]      sd_sec_read_data,          //SD card sector read data
 	output           sd_sec_read_data_valid,    //SD card sector read data valid
 	output           sd_sec_read_end,           //SD card sector read end
@@ -56,6 +57,7 @@ sd_card_sec_read_write_m0(
 	.sd_init_done                   (sd_init_done           ),
 	.sd_sec_read                    (sd_sec_read            ),
 	.sd_sec_read_addr               (sd_sec_read_addr       ),
+	.sd_sec_read_count              (sd_sec_read_count      ),
 	.sd_sec_read_data               (sd_sec_read_data       ),
 	.sd_sec_read_data_valid         (sd_sec_read_data_valid ),
 	.sd_sec_read_end                (sd_sec_read_end        ),
@@ -92,6 +94,7 @@ sd_card_cmd sd_card_cmd_m0(
 	.cmd_r1                         (cmd_r1                 ),
 	.cmd_data_len                   (cmd_data_len           ),
 	.block_read_req                 (block_read_req         ),
+	.block_read_secs                (sd_sec_read_count      ),
 	.block_read_req_ack             (block_read_req_ack     ),
 	.block_read_data                (block_read_data        ),
 	.block_read_valid               (block_read_valid       ),

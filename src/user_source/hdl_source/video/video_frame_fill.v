@@ -42,6 +42,7 @@ module video_frame_fill #(
 
     output reg         o_disp_bank,   // 显示缓冲（读侧）
     output reg         o_ready,       // 初始化完成，可以显示视频
+    output wire        o_frame_ready, // 空闲，可接收新的帧起始（防止丢帧）
     output wire        o_busy,
     output reg         o_frame_end
 );
@@ -165,6 +166,9 @@ module video_frame_fill #(
     reg [20:0] zcnt;
 
     assign o_busy = (st != E_OFF) && (st != E_IDLE);
+    // 只有 E_IDLE 会接受 i_frame_start，因此读端必须等这个电平再发起下一帧，
+    // 否则上一帧尾行的 296 行写口还没收完，新帧的起始脉冲会被丢掉（隔帧丢图）
+    assign o_frame_ready = (st == E_IDLE);
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin

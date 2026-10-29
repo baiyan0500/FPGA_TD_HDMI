@@ -11,9 +11,11 @@ module tb_egv_reader;
 
     reg clk = 0, rst = 1;
     reg play = 0, sd_ready = 0;
+    reg fill_ready = 1'b1;          // 填充器背压（bug2：填充未结束不得起新帧）
 
     wire        o_sd_read;
     wire [31:0] o_sd_addr;
+    wire [15:0] o_sd_count;
     reg  [7:0]  i_sd_data = 8'd0;
     reg         i_sd_data_valid = 1'b0;
     reg         i_sd_read_end = 1'b0;
@@ -29,7 +31,8 @@ module tb_egv_reader;
 
     egv_reader #(.FRAME_CYC(23'd210)) dut (
         .clk(clk), .rst(rst), .i_play(play), .i_sd_ready(sd_ready),
-        .o_sd_read(o_sd_read), .o_sd_addr(o_sd_addr),
+        .i_fill_ready(fill_ready),
+        .o_sd_read(o_sd_read), .o_sd_addr(o_sd_addr), .o_sd_count(o_sd_count),
         .i_sd_data(i_sd_data), .i_sd_data_valid(i_sd_data_valid),
         .i_sd_read_end(i_sd_read_end),
         .o_pix_en(o_pix_en), .o_pix(o_pix), .o_frame_start(o_frame_start),
@@ -46,20 +49,28 @@ module tb_egv_reader;
     reg [8:0]  bcnt;
     reg        busy;
     reg        started;
+    reg [15:0] bleft;          // 本批剩余扇区数（CMD18 流式读：批内地址自增）
 
     always @(posedge clk) begin
         i_sd_data_valid <= 1'b0;
         i_sd_read_end   <= 1'b0;
         if (rst) begin
             busy <= 1'b0; started <= 1'b0; bcnt <= 9'd0; cur <= 32'd0;
+            bleft <= 16'd0;
         end else if (!o_sd_read) begin
-            busy <= 1'b0; started <= 1'b0; bcnt <= 9'd0;
+            busy <= 1'b0; started <= 1'b0; bcnt <= 9'd0; bleft <= 16'd0;
         end else if (!busy) begin
             busy <= 1'b1; started <= 1'b0;
         end else if (!started) begin
-            cur <= o_sd_addr;
             started <= 1'b1;
-            bcnt <= 9'd0;
+            bcnt    <= 9'd0;
+            if (bleft == 16'd0) begin
+                cur   <= o_sd_addr;      // 批起点：按 reader 给出的地址/数量
+                bleft <= o_sd_count - 16'd1;   // 本扇区之后本批剩余的扇区数
+            end else begin
+                cur   <= cur + 32'd1;    // 批内：物理连续
+                bleft <= bleft - 16'd1;
+            end
         end else begin
             i_sd_data       <= cur[7:0] + bcnt[7:0];
             i_sd_data_valid <= 1'b1;
@@ -93,18 +104,48 @@ module tb_egv_reader;
         end
     endfunction
 
+    // CMD18 流式读：批内地址由卡自增，只有批起点才采样 o_sd_addr
     reg [31:0] seen_addr;
     always @(posedge clk) begin
-        if (!rst && busy && bcnt == 9'd0)
+        if (!rst && !busy && o_sd_read)
             seen_addr <= o_sd_addr;
+    end
+
+    // 批起点必须是"段剩余"与"帧剩余"的较小值，且地址与逻辑扇区一致
+    integer cnt_err = 0;
+    function [15:0] exp_cnt(input integer g);
+        integer rl, fl;
+        begin
+            if (g < `EGV_RG1)      rl = `EGV_RG1 - g;
+            else if (g < `EGV_RG2) rl = `EGV_RG2 - g;
+            else                   rl = 1000000;
+            fl = `EGV_BLOCK_SECTORS - (g % `EGV_BLOCK_SECTORS);
+            exp_cnt = (rl < fl) ? rl[15:0] : fl[15:0];
+        end
+    endfunction
+
+    always @(posedge clk) begin
+        if (!rst && busy && !started && o_sd_read && (bleft == 16'd0)) begin
+            if (o_sd_count !== exp_cnt(gsec)) begin
+                if (cnt_err < 5)
+                    $display("CNT ERR g=%0d got %0d exp %0d", gsec, o_sd_count, exp_cnt(gsec));
+                cnt_err = cnt_err + 1;
+            end
+            if (o_sd_addr !== exp_phys(gsec)) begin
+                if (cnt_err < 5)
+                    $display("BATCH ADDR ERR g=%0d got %0d exp %0d",
+                             gsec, o_sd_addr, exp_phys(gsec));
+                cnt_err = cnt_err + 1;
+            end
+        end
     end
 
     always @(posedge clk) begin
         if (!rst && i_sd_read_end) begin
-            if (seen_addr !== exp_phys(gsec)) begin
+            if (cur !== exp_phys(gsec)) begin
                 if (addr_err < 5)
                     $display("ADDR ERR g=%0d got %0d exp %0d",
-                             gsec, seen_addr, exp_phys(gsec));
+                             gsec, cur, exp_phys(gsec));
                 addr_err = addr_err + 1;
             end
             gsec = gsec + 1;
@@ -123,18 +164,29 @@ module tb_egv_reader;
 
     always @(posedge clk) begin
         if (!rst && o_aud_en) begin
-            aud_mem[naud] = o_aud_byte;
+            if (naud < 16000)
+                aud_mem[naud] = o_aud_byte;
             naud = naud + 1;
             aud_in_frame = aud_in_frame + 1;
         end
     end
 
+    // 填充器未就绪时绝不允许发起新帧
+    integer gate_err = 0;
+    always @(posedge clk)
+        if (!rst && !fill_ready && o_frame_start) begin
+            $display("FAIL frame_start while fill busy t=%0t dut_ready=%b st=%0d",
+                     $time, dut.i_fill_ready, dut.st);
+            gate_err = gate_err + 1;
+        end
+
     // 帧结束检查
     wire frame_end = o_frame_start;   // 下一帧起始 == 上一帧结束
     always @(posedge clk) begin
         if (!rst && frame_end && frames_done > 0) begin
-            $display("frame %0d: pix=%0d aud=%0d", frames_done - 1,
-                     pix_in_frame, aud_in_frame);
+            if (frames_done <= 2)
+                $display("frame %0d: pix=%0d aud=%0d", frames_done - 1,
+                         pix_in_frame, aud_in_frame);
             if (pix_in_frame != `EGV_W * `EGV_H) begin
                 $display("FAIL pix count %0d", pix_in_frame); pix_err = pix_err + 1;
             end
@@ -160,8 +212,9 @@ module tb_egv_reader;
         sd_ready = 1;
         play = 1;
 
-        // 等两帧读完（第 3 次 frame_start 出现时结束）
-        wait (frames_done == 3);
+        // 连续读够长：必须越过 16384 扇区（旧 16bit 段计数器在此会提前"段结束"，
+        // 误跳到 RP2），逐扇区地址/批大小由 exp_phys/exp_cnt 独立复算比对
+        wait (gsec > 17600);
         repeat (10) @(posedge clk);
 
         // 像素复算：第 0 帧第 n 个像素 -> 视频扇区 n/256 的 2*(n%256)、+1 字节
@@ -194,6 +247,30 @@ module tb_egv_reader;
             end
         end
 
+        // ---- 填充器背压：i_fill_ready 拉低时 reader 必须停在帧间隔 ----
+        // 在帧中把填充器置忙（真实场景：填充 296 行比帧间隔长），
+        // 本帧读完后 reader 必须停在 S_FWAIT，且不得发起新帧。
+        @(negedge clk);
+        k = frames_done;
+        fill_ready = 1'b0;
+        repeat (300_000) @(posedge clk);          // 约 3 个帧周期
+        if (frames_done != k || dut.o_active !== 1'b1) begin
+            $display("FAIL backpressure: frames_done %0d->%0d active=%b",
+                     k, frames_done, dut.o_active);
+            eof_err = eof_err + 1;
+        end
+        if (dut.st !== 2'd1) begin                // 应卡在帧间隔等待
+            $display("FAIL backpressure: st=%0d (expect S_FWAIT)", dut.st);
+            eof_err = eof_err + 1;
+        end
+        @(negedge clk);
+        fill_ready = 1'b1;
+        repeat (20) @(posedge clk);
+        if (dut.st !== 2'd2) begin                // 放行后应立即开新帧
+            $display("FAIL backpressure: no resume (st=%0d)", dut.st);
+            eof_err = eof_err + 1;
+        end
+
         // ---- EOF 停止：把帧号强推到末帧，播完应停止取流并冻结 ----
         force dut.o_frame_no = `EGV_FRAMES - 1;
         k = 0;
@@ -217,6 +294,7 @@ module tb_egv_reader;
         // 松开 K1 再按：应从头重新播放
         release dut.o_frame_no;
         play = 0;
+        gsec = 0;                  // reader 从头重播，TB 逻辑扇区号同步归零
         repeat (10) @(posedge clk);
         play = 1;
         k = 0;
@@ -231,10 +309,10 @@ module tb_egv_reader;
             eof_err = eof_err + 1;
         end
 
-        $display("addr_err=%0d pix_err=%0d aud_err=%0d eof_err=%0d frames=%0d",
-                 addr_err, pix_err, aud_err, eof_err, frames_done);
-        if (addr_err == 0 && pix_err == 0 && aud_err == 0 && eof_err == 0 &&
-            frames_done >= 3)
+        $display("addr_err=%0d cnt_err=%0d pix_err=%0d aud_err=%0d eof_err=%0d gate_err=%0d frames=%0d",
+                 addr_err, cnt_err, pix_err, aud_err, eof_err, gate_err, frames_done);
+        if (addr_err == 0 && cnt_err == 0 && pix_err == 0 && aud_err == 0 &&
+            eof_err == 0 && gate_err == 0 && frames_done >= 3)
             $display("TB_EGV_READER PASS");
         else
             $display("TB_EGV_READER FAIL");
@@ -242,7 +320,7 @@ module tb_egv_reader;
     end
 
     initial begin
-        #20_000_000;
+        #400_000_000;
         $display("TB_EGV_READER TIMEOUT (frames=%0d gsec=%0d)", frames_done, gsec);
         $finish;
     end

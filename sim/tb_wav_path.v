@@ -89,60 +89,64 @@ wav_i2s_source dut_src (
 );
 
 // ---------------------------------------------------------------------------
-// WAV 头（44 字节，data 从偏移 44 开始）
+// WAV 头：+HDR=0 经典 44 字节；+HDR=1 真实卡布局（fmt16 @12，LIST26 @36，
+// data @70 → payload @78，chunk 起点非 4 字节对齐）；+HDR=2 含奇数长度 chunk
+// （junk size=5 + 1 字节填充）。
 // ---------------------------------------------------------------------------
-function [7:0] header_byte;
-    input integer i;
+reg [7:0] hdr [0:1023];
+integer   hdr_len  = 44;
+integer   hdr_mode = 0;
+
+task w8(input integer off, input [7:0] v);
+    begin hdr[off] = v; end
+endtask
+
+task w16(input integer off, input [15:0] v);
+    begin hdr[off] = v[7:0]; hdr[off+1] = v[15:8]; end
+endtask
+
+task w32(input integer off, input [31:0] v);
     begin
-        case (i)
-            0:  header_byte = 8'h52;                 // R
-            1:  header_byte = 8'h49;                 // I
-            2:  header_byte = 8'h46;                 // F
-            3:  header_byte = 8'h46;                 // F
-            4:  header_byte = 8'h24;                 // riff size=36+32768=0x8024
-            5:  header_byte = 8'h80;
-            6:  header_byte = 8'h00;
-            7:  header_byte = 8'h00;
-            8:  header_byte = 8'h57;                 // W
-            9:  header_byte = 8'h41;                 // A
-            10: header_byte = 8'h56;                 // V
-            11: header_byte = 8'h45;                 // E
-            12: header_byte = 8'h66;                 // 'f'
-            13: header_byte = 8'h6d;                 // 'm'
-            14: header_byte = 8'h74;                 // 't'
-            15: header_byte = 8'h20;                 // ' '
-            16: header_byte = 8'd16;
-            17: header_byte = 8'd0;
-            18: header_byte = 8'd0;
-            19: header_byte = 8'd0;
-            20: header_byte = 8'd1;                  // PCM
-            21: header_byte = 8'd0;
-            22: header_byte = STEREO ? 8'd2 : 8'd1;  // channels
-            23: header_byte = 8'd0;
-            24: header_byte = 8'h80;                 // 48000 = 0xBB80
-            25: header_byte = 8'hBB;
-            26: header_byte = 8'h00;
-            27: header_byte = 8'h00;
-            28: header_byte = 8'h00;                 // byte rate 96000(mono)/192000(st)
-            29: header_byte = STEREO ? 8'hEE : 8'h77;
-            30: header_byte = STEREO ? 8'h02 : 8'h01;
-            31: header_byte = 8'h00;
-            32: header_byte = STEREO ? 8'd4 : 8'd2;  // block align
-            33: header_byte = 8'd0;
-            34: header_byte = 8'd16;                 // bits
-            35: header_byte = 8'd0;
-            36: header_byte = 8'h64;                 // 'd'
-            37: header_byte = 8'h61;                 // 'a'
-            38: header_byte = 8'h74;                 // 't'
-            39: header_byte = 8'h61;                 // 'a'
-            40: header_byte = 8'h00;                 // data size=32768=0x8000
-            41: header_byte = 8'h80;
-            42: header_byte = 8'h00;
-            43: header_byte = 8'h00;
-            default: header_byte = 8'h00;
-        endcase
+        hdr[off]   = v[7:0];  hdr[off+1] = v[15:8];
+        hdr[off+2] = v[23:16];hdr[off+3] = v[31:24];
     end
-endfunction
+endtask
+
+task wtag(input integer off, input [31:0] v);
+    begin hdr[off] = v[31:24]; hdr[off+1] = v[23:16]; hdr[off+2] = v[15:8]; hdr[off+3] = v[7:0]; end
+endtask
+
+task build_hdr;
+    integer p, k;
+    reg [15:0] ch;
+    reg [31:0] br;
+    begin
+        for (k = 0; k < 1024; k = k + 1) hdr[k] = 8'h00;
+        ch = STEREO ? 16'd2 : 16'd1;
+        br = 48000 * ch * 2;
+        wtag(0, "RIFF"); w32(4, 36 + DATA_SIZE); wtag(8, "WAVE");
+        p = 12;
+        if (hdr_mode == 2) begin           // 奇数长度 chunk + 填充字节
+            wtag(p, "junk"); w32(p+4, 32'd5);
+            w8(p+8, 8'hA5); w8(p+9, 8'h5A); w8(p+10, 8'h11);
+            w8(p+11, 8'h22); w8(p+12, 8'h33);
+            p = p + 8 + 5 + 1;
+        end
+        wtag(p, "fmt "); w32(p+4, 32'd16);
+        w16(p+8, 16'd1); w16(p+10, ch); w32(p+12, 32'd48000);
+        w32(p+16, br); w16(p+20, ch*2); w16(p+22, 16'd16);
+        p = p + 8 + 16;
+        if (hdr_mode >= 1) begin          // LIST/INFO：实际卡上 size=26 的元数据块
+            wtag(p, "LIST"); w32(p+4, 32'd26);
+            wtag(p+8, "INFO");
+            for (k = 0; k < 22; k = k + 1) w8(p + 12 + k, 8'h20 + k[7:0]);
+            p = p + 8 + 26;
+        end
+        wtag(p, "data"); w32(p+4, DATA_SIZE);
+        p = p + 8;
+        hdr_len = p;
+    end
+endtask
 
 function [7:0] sec_byte;
     input [31:0] sec;
@@ -150,10 +154,10 @@ function [7:0] sec_byte;
     integer foff, g, w, s, v;
     begin
         foff = (sec - SECTOR_BASE) * 512 + i;
-        if (foff < 44) begin
-            sec_byte = header_byte(foff);
+        if (foff < hdr_len) begin
+            sec_byte = hdr[foff];
         end else begin
-            g = foff - 44;
+            g = foff - hdr_len;
             w = g / 2;
             if (STEREO) begin
                 s = (w / 2) % FRAMES_TOTAL;
@@ -335,11 +339,11 @@ always @(posedge mclk) begin
                     end
                 end
                 if ((ferr_cnt + werr_cnt + serr_cnt) == 0)
-                    $display("PASS stereo=%0d frames=%0d pops=%0d max_fifo=%0d",
-                             STEREO, fcnt, rd_cnt, max_occ);
+                    $display("PASS stereo=%0d hdr=%0d frames=%0d pops=%0d max_fifo=%0d",
+                             STEREO, hdr_mode, fcnt, rd_cnt, max_occ);
                 else
-                    $display("FAIL stereo=%0d slope=%0d word=%0d sector=%0d frames=%0d",
-                             STEREO, ferr_cnt, werr_cnt, serr_cnt, fcnt);
+                    $display("FAIL stereo=%0d hdr=%0d slope=%0d word=%0d sector=%0d frames=%0d",
+                             STEREO, hdr_mode, ferr_cnt, werr_cnt, serr_cnt, fcnt);
                 $finish;
             end
         end
@@ -352,6 +356,9 @@ always @(posedge clk) begin
 end
 
 initial begin
+    if ($value$plusargs("HDR=%d", hdr_mode)) ;
+    build_hdr;
+    $display("hdr_mode=%0d hdr_len=%0d data_size=%0d", hdr_mode, hdr_len, DATA_SIZE);
     rst = 1;
     #200;
     rst = 0;

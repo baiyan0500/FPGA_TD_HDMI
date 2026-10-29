@@ -18,6 +18,7 @@ __pycache__/
 
 # ModelSim generated outputs
 sim/work/
+sim/work_*/
 sim/*.wlf
 sim/dump_seq.txt
 

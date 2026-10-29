@@ -24,10 +24,12 @@ module egv_reader #(
     input  wire        rst,
     input  wire        i_play,          // 播放电平（准静态，已跨域同步）
     input  wire        i_sd_ready,      // SD 初始化完成
+    input  wire        i_fill_ready,    // 帧填充器空闲（可接收新的帧起始）
 
     // ---- SD 扇区读客户端 ----
     output reg         o_sd_read,
     output reg  [31:0] o_sd_addr,
+    output reg  [15:0] o_sd_count,      // 本批连续扇区数（CMD18 流式读）
     input  wire [7:0]  i_sd_data,
     input  wire        i_sd_data_valid,
     input  wire        i_sd_read_end,
@@ -54,6 +56,7 @@ module egv_reader #(
     localparam [7:0]  LAST_SEC   = BLOCK_SEC - 1;
     localparam [3:0]  AMOD_LAST  = `EGV_AUDIO_MOD - 1;
     localparam [12:0] AUD_BYTES_V = AUD_BYTES;
+    localparam [15:0] BLOCK_SEC_V = BLOCK_SEC;
     localparam [15:0] LAST_FRAME = `EGV_FRAMES - 1;
 
     reg [1:0]  st;
@@ -62,28 +65,66 @@ module egv_reader #(
     reg        byte_ph;       // 0=高字节先（视频）/低字节先（音频）
     reg [7:0]  byte_hi;
     reg [12:0] aud_cnt;       // 本帧已送出的有效音频字节数
-    reg [31:0] gsec;          // 全局扇区号（跨帧累加）
     reg [31:0] phys;          // 当前物理 LBA
     reg [22:0] ftmr;
     reg        first;
     reg        stop_req;
     reg        eof_stop;      // 已播完整个容器：停在最后一帧，等 K1 重新启动
+    reg [15:0] nb;            // 当前批剩余扇区数（含正在读的扇区）
+    reg [1:0]  run_i;         // 当前物理段号（0..2）
+    reg [19:0] run_rem;       // 本段剩余扇区数（含下一个要读的扇区），饱和于 RUN_MAX
+
+    // 段长必须精确：中间段可达数十万扇区（本容器 run1 = 385024），
+    // 16bit 饱和会让"段结束"提前触发 → 中途误跳到 RP2，读到错位的数据流。
+    // 20bit 上限 1048575 扇区（512MB），足够覆盖任意单段；批大小仍只需与 201 比较。
+    localparam [19:0] RUN_MAX  = 20'hFFFFF;
+    localparam [31:0] RUN0_SPAN = `EGV_RG1 - `EGV_RG0;
+    localparam [31:0] RUN1_SPAN = `EGV_RG2 - `EGV_RG1;
+    localparam [19:0] RUN0_LEN = (RUN0_SPAN > 32'd1048575) ? RUN_MAX : RUN0_SPAN[19:0];
+    localparam [19:0] RUN1_LEN = (RUN1_SPAN > 32'd1048575) ? RUN_MAX : RUN1_SPAN[19:0];
 
     wire frame_last = (o_frame_no == LAST_FRAME);
 
     wire is_audio = (amod_cnt == AMOD_LAST);
 
-    // ---- 段表换算：顺序递增，跨段时跳到下一段物理起点 ----
-    wire [31:0] gsec_n = gsec + 32'd1;
-    reg  [31:0] phys_n;
-    always @(*) begin
-        if (gsec_n == `EGV_RG1)      phys_n = `EGV_RP1;
-        else if (gsec_n == `EGV_RG2) phys_n = `EGV_RP2;
-        else if (gsec_n == `EGV_RG3) phys_n = `EGV_RP3;
-        else                         phys_n = phys + 32'd1;
-    end
+    // ---- 段表推进：逐扇区 +1，跨段时跳到下一段物理起点 ----
+    // 20bit 计数器代替 gsec 的 32bit 减法，批大小组合逻辑由 13.4ns 降到 ~6ns
+    wire        run_xn       = (run_rem == 20'd1);
+    wire [19:0] run_len_next = (run_i == 2'd0) ? RUN1_LEN : RUN_MAX;
+    wire [19:0] run_rem_n    = run_xn ? run_len_next : (run_rem - 20'd1);
+    wire [31:0] rp_next      = (run_i == 2'd0) ? `EGV_RP1 :
+                               (run_i == 2'd1) ? `EGV_RP2 : `EGV_RP3;
+    wire [31:0] phys_nx      = run_xn ? rp_next : (phys + 32'd1);
 
-    wire frame_start_now = (st == S_FWAIT) && i_play && !stop_req &&
+    // ---- 批大小：min(本段剩余, 本帧剩余) ----
+    // CMD18 连续读只有段内物理地址连续，因此每跨一段就结束本批、从新段起点重开。
+    // 帧起始时 sec_i 还是上一帧的末值，故按"整帧剩余"算。
+    // 段剩余只需与 201 比较，先饱和到 16bit 再做窄比较（避免 20bit 宽比较进批大小链）
+    function [15:0] sat16;
+        input [19:0] v;
+        begin
+            sat16 = (|v[19:16]) ? 16'hFFFF : v[15:0];
+        end
+    endfunction
+    // run_rem 只在扇区结束才更新，故下一拍的段剩余可每拍预算并寄存：
+    // 批大小链变成 寄存器→16bit 比较→mux，20bit 减法只到寄存器（原 8 级 10.1ns）
+    reg [19:0] run_rem_n_q;
+    reg [15:0] rem_n_s_q;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            run_rem_n_q <= RUN0_LEN;
+            rem_n_s_q   <= 16'hFFFF;
+        end else begin
+            run_rem_n_q <= run_xn ? run_len_next : (run_rem - 20'd1);
+            rem_n_s_q   <= sat16(run_xn ? run_len_next : (run_rem - 20'd1));
+        end
+    end
+    wire [15:0] rem_s        = sat16(run_rem);
+    wire [15:0] batch_s = (rem_s < BLOCK_SEC_V) ? rem_s : BLOCK_SEC_V;
+    wire [15:0] frame_left_n = BLOCK_SEC_V - {8'd0, sec_i} - 16'd1;
+    wire [15:0] batch_n = (rem_n_s_q < frame_left_n) ? rem_n_s_q : frame_left_n;
+
+    wire frame_start_now = (st == S_FWAIT) && i_play && !stop_req && i_fill_ready &&
                            (first || (ftmr >= FRAME_CYC));
 
     always @(posedge clk or posedge rst) begin
@@ -91,6 +132,8 @@ module egv_reader #(
             st           <= S_IDLE;
             o_sd_read    <= 1'b0;
             o_sd_addr    <= 32'd0;
+            o_sd_count   <= BLOCK_SEC_V;
+            nb           <= 16'd0;
             o_pix_en     <= 1'b0;
             o_pix        <= 16'd0;
             o_frame_start<= 1'b0;
@@ -104,8 +147,9 @@ module egv_reader #(
             byte_ph      <= 1'b0;
             byte_hi      <= 8'd0;
             aud_cnt      <= 13'd0;
-            gsec         <= 32'd0;
             phys         <= `EGV_RP0;
+            run_i        <= 2'd0;
+            run_rem      <= RUN0_LEN;
             ftmr         <= 23'd0;
             first        <= 1'b1;
             stop_req     <= 1'b0;
@@ -137,13 +181,16 @@ module egv_reader #(
                 o_sd_read <= 1'b0;
                 o_active  <= 1'b0;
                 if (i_play && !stop_req && !eof_stop && i_sd_ready) begin
-                    gsec    <= 32'd0;
                     phys    <= `EGV_RP0;
+                    run_i   <= 2'd0;
+                    run_rem <= RUN0_LEN;
                     sec_i   <= 8'd0;
                     aud_cnt <= 13'd0;
                     first   <= 1'b1;
                     o_frame_no <= 16'd0;
                     o_active<= 1'b1;
+                    o_sd_count <= BLOCK_SEC_V;
+                    nb      <= 16'd0;
                     st      <= S_FWAIT;
                 end
             end
@@ -163,6 +210,8 @@ module egv_reader #(
                     o_aud_fstart <= 1'b1;
                     o_sd_read    <= 1'b1;
                     o_sd_addr    <= phys;
+                    o_sd_count   <= batch_s;
+                    nb           <= batch_s;
                     st           <= S_SEC;
                 end
             end
@@ -189,8 +238,9 @@ module egv_reader #(
                 end
 
                 if (i_sd_read_end) begin
-                    gsec    <= gsec_n;
-                    phys    <= phys_n;
+                    phys    <= phys_nx;
+                    run_rem <= run_rem_n;
+                    run_i   <= run_xn ? (run_i + 2'd1) : run_i;
                     byte_ph <= 1'b0;                 // 512B 偶数长度，保险对齐
                     if (sec_i == LAST_SEC) begin
                         o_sd_read  <= 1'b0;
@@ -207,7 +257,15 @@ module egv_reader #(
                     end else begin
                         sec_i    <= sec_i + 8'd1;
                         amod_cnt <= (amod_cnt == AMOD_LAST) ? 4'd0 : amod_cnt + 4'd1;
-                        o_sd_addr<= phys_n;          // 读核下一拍锁存地址
+                        if (nb <= 16'd1) begin
+                            // 本批读空：从下一段/下一批起点重开一条 CMD18
+                            o_sd_addr  <= phys_nx;
+                            o_sd_count <= batch_n;
+                            nb         <= batch_n;
+                        end else begin
+                            o_sd_count <= nb - 16'd1;
+                            nb         <= nb - 16'd1;
+                        end
                     end
                 end
             end
