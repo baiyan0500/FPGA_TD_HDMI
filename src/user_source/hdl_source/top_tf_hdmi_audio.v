@@ -34,6 +34,10 @@ parameter BUSRT_BITS    = 10;
 parameter FRAME_PIXELS  = 24'd307200;   // 640*480
 parameter BUF0_ADDR     = 24'd0;
 parameter BUF1_ADDR     = FRAME_PIXELS;
+parameter BUF2_ADDR     = 24'd614400;   // 视频双缓冲（层3）
+parameter BUF3_ADDR     = 24'd921600;
+// 148 行居中后上下各 92 行黑边，中间 296 行只在帧内局部重写
+parameter VID_TOP_OFF   = 24'd58880;    // 92 * 640
 
 wire Sdr_init_done;
 wire Sdr_init_ref_vld;
@@ -55,13 +59,18 @@ wire [23:0] bc_rgb;
 wire [23:0] trans_rgb;
 wire        fade_req;
 wire        fade_swap;
+wire [1:0]  ctrl_layer;
 wire [1:0]  ctrl_mode;
 wire [2:0]  ctrl_bright;
 wire [2:0]  ctrl_contrast;
 wire        ctrl_auto_play;
-wire        ctrl_audio_viz;
 wire        ctrl_audio_pause;
-wire        ctrl_spectrum_en;
+wire        ctrl_next_img_en;
+wire [1:0]  ctrl_viz_mode;
+wire        ctrl_video_play;
+wire        ctrl_danmaku_en;
+wire        ctrl_spectrum_en;      // 层3 频谱开关
+wire        ctrl_resmon_en;
 wire [7:0]  audio_level;
 wire [191:0] spec_level;
 
@@ -111,6 +120,77 @@ reg         frame_write_toggle_mem;
 
 wire [1:0]  write_buf_idx;
 wire [1:0]  disp_buf_idx;
+
+// ---- 层3 视频链（sd_card_clk 100MHz 域）----
+wire        vid_layer_v;        // 层3 选中（video_clk 域）
+wire        vid_layer;          // 层3 选中（100MHz 域）
+wire        vid_play_v;         // 用户播放开关（video_clk 域）
+wire        vid_play_w;         // 100MHz 域
+wire        vid_wr_own;         // 视频独占帧写口（含收尾）
+wire        vid_load_busy;
+
+wire        egv_sd_read;
+wire [31:0] egv_sd_addr;
+wire        egv_cli_dv;
+wire [7:0]  egv_cli_data;
+wire        egv_cli_end;
+
+wire        egv_pix_en;
+wire [15:0] egv_pix;
+wire        egv_fstart;
+wire        egv_aud_en;
+wire [7:0]  egv_aud_byte;
+wire        egv_afstart;
+wire [15:0] egv_frame_no;
+
+wire        vf_wr_req;
+wire        vf_wr_ack;
+wire        vf_wr_en;
+wire [31:0] vf_wr_data;
+wire [20:0] vf_wr_len;
+wire        vf_wr_bank;
+wire        vf_addr_full;
+wire        vf_disp_bank;
+wire        vf_ready;
+wire        vf_busy;
+wire        vf_frame_end;
+reg         vid_ftgl;
+
+wire        wr_ack_all;
+wire        wr_req_mux;
+wire        wr_en_mux;
+wire [31:0] wr_data_mux;
+wire [20:0] wr_len_mux;
+wire [1:0]  wr_idx_mux;
+wire        wr_vflip_mux;
+wire [23:0] wr_addr0_mux, wr_addr1_mux, wr_addr2_mux, wr_addr3_mux;
+
+wire [23:0] rd_addr_idx_mux;
+
+// ---- 视频音轨 FIFO ----
+wire        vid_aud_on;         // 视频音轨有效（100MHz 域）
+wire        vid_aud_on_m;       // audio_mclk 域
+wire        vid_layer_m;        // 层3 选中（audio_mclk 域）
+wire        vid_play_m;         // 播放开关（audio_mclk 域）
+wire        vid_aud_arm_m;      // 首帧已落地（audio_mclk 域）
+wire        aud_sel_m;          // 音频源选择（audio_mclk 域）
+wire        egv_afifo_rden;
+wire [15:0] egv_afifo_data;
+wire        egv_afifo_empty;
+wire        aud_rden;
+wire [15:0] aud_data;
+wire        aud_empty;
+wire        aud_active;
+wire [32:0] aud_step;
+wire        aud_stereo;
+wire        aud_pause;
+wire        dm_tgl;             // 50MHz 域：新弹幕 toggle
+wire [191:0] dm_text;
+wire [4:0]  dm_len;
+reg  [3:0]  dm_color_seed;
+reg         dm_tgl_r;
+wire        vid_on_v;           // 层3 且正在播放（video_clk 域）
+wire        vid_show;           // 层3 选中且视频缓冲已就绪（video_clk 域）
 
 wire App_rd_en;
 wire [ADDR_BITS-1:0] App_rd_addr;
@@ -234,6 +314,7 @@ sd_card_bmp #(
     .rst               (rst_all),
     .key_next          (k2),
     .key_auto          (ctrl_auto_play),
+    .i_next_en         (next_img_en_w),
     .state_code        (state_code),
     .img_count         (img_count),
     .sd_ready          (sd_ready),
@@ -268,7 +349,15 @@ sd_card_bmp #(
     .wav_rd_clk        (audio_mclk),
     .wav_fifo_rd_en    (wav_fifo_rd_en),
     .wav_fifo_rd_data  (wav_fifo_rd_data),
-    .wav_fifo_empty    (wav_fifo_empty)
+    .wav_fifo_empty    (wav_fifo_empty),
+
+    .i_video_play      (vid_wr_own),
+    .i_egv_sd_read     (egv_sd_read),
+    .i_egv_sd_addr     (egv_sd_addr),
+    .o_cli_data_valid  (egv_cli_dv),
+    .o_cli_data        (egv_cli_data),
+    .o_cli_read_end    (egv_cli_end),
+    .o_load_busy       (vid_load_busy)
 );
 
 // 原始逻辑：数码管显示 SD 状态码 state_code（默认）
@@ -340,7 +429,7 @@ always @(posedge video_clk or posedge rst_all) begin
         display_valid_s2 <= display_valid_s1;
     end
 end
-assign vout_data = display_valid_s2 ? vout_data_raw : 24'd0;
+assign vout_data = (display_valid_s2 | vid_show) ? vout_data_raw : 24'd0;
 
 // 启动状态跨域：100MHz 准静态电平 → video_clk 2 级同步
 reg        sd_ready_s1, sd_ready_s2;
@@ -360,9 +449,56 @@ always @(posedge video_clk or posedge rst_all) begin
         img_count_s2 <= img_count_s1;
     end
 end
+
+// 视频显示缓冲号 / 就绪标志跨域（100MHz → video_clk，准静态；读 FSM 在 vs 后锁存）
+reg vf_disp_bank_s1, vf_disp_bank_s2;
+reg vf_ready_s1, vf_ready_s2;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        vf_disp_bank_s1 <= 1'b0;
+        vf_disp_bank_s2 <= 1'b0;
+        vf_ready_s1     <= 1'b0;
+        vf_ready_s2     <= 1'b0;
+    end else begin
+        vf_disp_bank_s1 <= vf_disp_bank;
+        vf_disp_bank_s2 <= vf_disp_bank_s1;
+        vf_ready_s1     <= vf_ready;
+        vf_ready_s2     <= vf_ready_s1;
+    end
+end
+// 视频缓冲黑场初始化完成前只出黑屏，避免上电 SDRAM 随机内容闪一下
+assign vid_show = vid_layer_v & vf_ready_s2;
+assign rd_addr_idx_mux = vid_layer_v ? (24'd2 + vf_disp_bank_s2)
+                                     : {22'd0, disp_buf_idx};
 // 源尺寸 BCD 为 100MHz 域准静态总线，与 src_tgl 一同更新；
 // osd_layer 内部用 2 级同步的 toggle 边沿锁存，无需在此再打拍
 
+// ===================== 层3 视频链跨域（video_clk → sd_card_clk）=====================
+reg [1:0] vid_layer_s;
+reg [1:0] vid_play_s;
+reg [1:0] next_img_s;
+
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all) begin
+        vid_layer_s <= 2'd0;
+        vid_play_s  <= 2'd0;
+        next_img_s  <= 2'd0;
+    end else begin
+        vid_layer_s <= {vid_layer_s[0], vid_layer_v};
+        vid_play_s  <= {vid_play_s[0],  vid_play_v};
+        next_img_s  <= {next_img_s[0],  ctrl_next_img_en};
+    end
+end
+
+assign vid_layer     = vid_layer_s[1];
+assign vid_play_w    = vid_play_s[1];
+assign next_img_en_w = next_img_s[1];
+
+wire egv_active;
+
+// 视频独占帧写口：选定层3 且 BMP 装载已结束才接管；收尾由 vf_busy / egv_active 维持，
+// 保证"半帧写口交接"不会发生（frame_fifo_write 无法中途改长度）
+assign vid_wr_own = (vid_layer & ~vid_load_busy) | vf_busy | egv_active;
 
 // ===================== UART 上位机标语接收 =====================
 uart_rx #(
@@ -388,22 +524,55 @@ slogan_ctrl u_slogan_ctrl(
     .o_scroll_en (slogan_scroll)
 );
 
+// ===================== 弹幕文本 =====================
+// 复用上位机输入的 ASCII 标语：取前 24 个字符，按 danmaku_osd 的低字节优先顺序重排；
+// 每条新消息翻转 toggle 并换一个起始色（同一条内逐字变色由 danmaku_osd 完成）
+reg [191:0] dm_text_r;
+integer dm_i;
+always @(*) begin
+    for (dm_i = 0; dm_i < 24; dm_i = dm_i + 1)
+        dm_text_r[dm_i*8 +: 8] = slogan_data[(31-dm_i)*8 +: 8];
+end
+assign dm_text = dm_text_r;
+assign dm_len  = (slogan_len > 6'd24) ? 5'd24 : slogan_len[4:0];
+assign dm_tgl  = dm_tgl_r;
+
+always @(posedge clk or posedge rst_all) begin
+    if (rst_all) begin
+        dm_tgl_r      <= 1'b0;
+        dm_color_seed <= 4'd0;
+    end else if (slogan_update) begin
+        dm_tgl_r      <= ~dm_tgl_r;
+        dm_color_seed <= dm_color_seed + 4'd1;
+    end
+end
+
 // ===================== 按键/拨码控制（K1模式 K3对比度 K4亮度 SW层选择）=====================
 ctrl u_ctrl(
     .i_clk      (video_clk),
     .i_rst      (rst_all),
     .i_k1       (k1),
+    .i_k2       (k2),
     .i_k3       (k3),
     .i_k4       (k4),
     .i_sw       (sw),
+    .o_layer    (ctrl_layer),
     .o_mode     (ctrl_mode),
     .o_bright   (ctrl_bright),
     .o_contrast (ctrl_contrast),
+    .o_next_img_en(ctrl_next_img_en),
     .o_auto_play(ctrl_auto_play),
-    .o_audio_viz(ctrl_audio_viz),
     .o_audio_pause(ctrl_audio_pause),
-    .o_spectrum_en(ctrl_spectrum_en)
+    .o_viz_mode (ctrl_viz_mode),
+    .o_video_play(ctrl_video_play),
+    .o_danmaku_en(ctrl_danmaku_en),
+    .o_spectrum_en(ctrl_spectrum_en),
+    .o_resmon_en(ctrl_resmon_en)
 );
+
+assign vid_layer_v = (ctrl_layer == 2'd3);
+assign vid_play_v  = ctrl_video_play;
+assign vid_on_v    = vid_layer_v & vid_play_v;
 
 // ===================== 音频幅度提取 + 峰值保持（video_clk 域，与 I2S 接收输出同域）=====================
 reg [7:0]  audio_amp;
@@ -460,11 +629,20 @@ osd_layer u_osd_layer(
     .i_slogan_dir   (slogan_dir),
     .i_slogan_update(slogan_update),
     .i_slogan_scroll(slogan_scroll),
-    .i_audio_viz(ctrl_audio_viz),
-    .i_audio_level(audio_level),
-    .i_spectrum_en(ctrl_spectrum_en),
-    .i_spec_level(spec_level),
-    .i_display_valid(display_valid_s2),
+    .i_viz_mode     (ctrl_viz_mode),
+    .i_spec_en      (ctrl_spectrum_en),
+    .i_audio_level  (audio_level),
+    .i_spec_level   (spec_level),
+    .i_dm_en        (ctrl_danmaku_en),
+    .i_dm_text      (dm_text),
+    .i_dm_len       (dm_len),
+    .i_dm_color     (dm_color_seed),
+    .i_dm_tgl       (dm_tgl),
+    .o_dm_ack       (),
+    .i_rm_en        (ctrl_resmon_en),
+    .i_video_on     (vid_on_v),
+    .i_vid_ftgl     (vid_ftgl),
+    .i_display_valid(display_valid_s2 | vid_show),
     .i_sd_init_done(sd_ready_s2),
     .i_scan_done(scan_done_s2),
     .i_img_count(img_count_s2),
@@ -477,6 +655,21 @@ osd_layer u_osd_layer(
     .o_de       (osd_de),
     .o_rgb      (osd_rgb)
 );
+
+// ---- 帧写口复用：BMP（翻转、整帧） / 视频（顺序、中间 296 行）----
+assign wr_req_mux   = vid_wr_own ? vf_wr_req  : sd_card_write_req;
+assign wr_en_mux    = vid_wr_own ? vf_wr_en   : sd_card_write_en;
+assign wr_data_mux  = vid_wr_own ? vf_wr_data : sd_card_write_data;
+assign wr_len_mux   = vid_wr_own ? vf_wr_len  : FRAME_PIXELS[20:0];
+// 视频初始化整帧（基址 0）用 0/1 号；局部写用 2/3 号（基址带 92 行偏移）
+assign wr_idx_mux   = vid_wr_own ? (vf_addr_full ? {1'b0, vf_wr_bank}
+                                                 : {1'b1, vf_wr_bank})
+                                 : write_buf_idx;
+assign wr_vflip_mux = ~vid_wr_own;
+assign wr_addr0_mux = vid_wr_own ? BUF2_ADDR : BUF0_ADDR;
+assign wr_addr1_mux = vid_wr_own ? BUF3_ADDR : BUF1_ADDR;
+assign wr_addr2_mux = BUF2_ADDR + VID_TOP_OFF;
+assign wr_addr3_mux = BUF3_ADDR + VID_TOP_OFF;
 
 frame_read_write #(
     .WRITE_V_FLIP     (1),
@@ -500,9 +693,9 @@ frame_read_write #(
     .read_finish       (),
     .read_addr_0       (BUF0_ADDR),
     .read_addr_1       (BUF1_ADDR),
-    .read_addr_2       (24'd0),
-    .read_addr_3       (24'd0),
-    .read_addr_index   (disp_buf_idx),
+    .read_addr_2       (BUF2_ADDR),
+    .read_addr_3       (BUF3_ADDR),
+    .read_addr_index   (rd_addr_idx_mux),
     .read_len          (FRAME_PIXELS),
     .read_en           (video_read_en),
     .read_data         (video_read_data),
@@ -513,18 +706,125 @@ frame_read_write #(
     .App_wr_dm         (App_wr_dm),
 
     .write_clk         (sd_card_clk),
-    .write_req         (sd_card_write_req),
-    .write_req_ack     (sd_card_write_req_ack),
+    .write_req         (wr_req_mux),
+    .write_req_ack     (wr_ack_all),
     .write_finish      (frame_write_finish),
-    .write_addr_0      (BUF0_ADDR),
-    .write_addr_1      (BUF1_ADDR),
-    .write_addr_2      (24'd0),
-    .write_addr_3      (24'd0),
-    .write_addr_index  (write_buf_idx),
-    .write_len         (FRAME_PIXELS),
-    .write_en          (sd_card_write_en),
-    .write_data        (sd_card_write_data)
+    .write_addr_0      (wr_addr0_mux),
+    .write_addr_1      (wr_addr1_mux),
+    .write_addr_2      (wr_addr2_mux),
+    .write_addr_3      (wr_addr3_mux),
+    .write_addr_index  (wr_idx_mux),
+    .write_len         (wr_len_mux),
+    .i_vflip           (wr_vflip_mux),
+    .write_en          (wr_en_mux),
+    .write_data        (wr_data_mux)
 );
+
+// 应答按所有权分发，避免视频帧的 ack 闯进 BMP 装载流程
+assign sd_card_write_req_ack = wr_ack_all & ~vid_wr_own;
+assign vf_wr_ack             = wr_ack_all &  vid_wr_own;
+
+// ===================== 层3 视频链（EGV → 2 倍放大 → SDRAM 双缓冲）=====================
+egv_reader #(
+    .FRAME_CYC        (23'd4_166_667)
+) u_egv_reader (
+    .clk              (sd_card_clk),
+    .rst              (rst_all),
+    .i_play           (vid_layer & vid_play_w & vf_ready & sd_ready & ~vid_load_busy),
+    .i_sd_ready       (sd_ready),
+    .o_sd_read        (egv_sd_read),
+    .o_sd_addr        (egv_sd_addr),
+    .i_sd_data        (egv_cli_data),
+    .i_sd_data_valid  (egv_cli_dv),
+    .i_sd_read_end    (egv_cli_end),
+    .o_pix_en         (egv_pix_en),
+    .o_pix            (egv_pix),
+    .o_frame_start    (egv_fstart),
+    .o_aud_en         (egv_aud_en),
+    .o_aud_byte       (egv_aud_byte),
+    .o_aud_fstart     (egv_afstart),
+    .o_frame_no       (egv_frame_no),
+    .o_active         (egv_active)
+);
+
+video_frame_fill u_video_frame_fill (
+    .clk              (sd_card_clk),
+    .rst              (rst_all),
+    .i_en             (vid_wr_own),
+    .i_frame_start    (egv_fstart),
+    .i_pix_en         (egv_pix_en),
+    .i_pix            (egv_pix),
+    .o_wr_req         (vf_wr_req),
+    .i_wr_ack         (vf_wr_ack),
+    .o_wr_en          (vf_wr_en),
+    .o_wr_data        (vf_wr_data),
+    .o_wr_len         (vf_wr_len),
+    .o_wr_bank        (vf_wr_bank),
+    .o_addr_full      (vf_addr_full),
+    .i_fin_tgl        (frame_write_toggle_mem),
+    .o_disp_bank      (vf_disp_bank),
+    .o_ready          (vf_ready),
+    .o_busy           (vf_busy),
+    .o_frame_end      (vf_frame_end)
+);
+
+// 每写出一帧视频翻转一次（资源面板据此显示帧号）
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all)
+        vid_ftgl <= 1'b0;
+    else if (vf_frame_end)
+        vid_ftgl <= ~vid_ftgl;
+end
+
+// 视频音轨跨时钟 FIFO（写 100MHz 字节流 / 读 audio_mclk FWFT）
+assign vid_aud_on = vid_layer & vid_play_w & vf_ready;
+
+// 首帧画面真正写进 SDRAM 后才放音频：既预填约 1 帧音频，又让第 0 帧声画对齐
+reg vid_aud_arm;
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all)
+        vid_aud_arm <= 1'b0;
+    else if (!vid_aud_on)
+        vid_aud_arm <= 1'b0;
+    else if (vf_frame_end)
+        vid_aud_arm <= 1'b1;
+end
+
+egv_audio_fifo u_egv_audio_fifo (
+    .i_wclk      (sd_card_clk),
+    .i_wrst      (rst_all),
+    .i_flush     (~vid_aud_on),
+    .i_fstart    (egv_afstart),
+    .i_wr_en     (egv_aud_en),
+    .i_wr_byte   (egv_aud_byte),
+    .o_count     (),
+    .i_rclk      (audio_mclk),
+    .i_rrst      (rst_all),
+    .i_flush_r   (~vid_aud_on_m),
+    .i_rd_en     (egv_afifo_rden),
+    .o_rd_data   (egv_afifo_data),
+    .o_rd_empty  (egv_afifo_empty)
+);
+
+// audio_mclk 域准静态同步
+reg [1:0] vl_s, vp_s, va_s, vm_s;
+always @(posedge audio_mclk or posedge rst_all) begin
+    if (rst_all) begin
+        vl_s <= 2'd0;
+        vp_s <= 2'd0;
+        va_s <= 2'd0;
+        vm_s <= 2'd0;
+    end else begin
+        vl_s <= {vl_s[0], vid_layer_v};
+        vp_s <= {vp_s[0], vid_play_v};
+        va_s <= {va_s[0], vid_aud_on};
+        vm_s <= {vm_s[0], vid_aud_arm};
+    end
+end
+assign vid_layer_m  = vl_s[1];
+assign vid_play_m   = vp_s[1];
+assign vid_aud_on_m = va_s[1];
+assign vid_aud_arm_m = vm_s[1];
 
 sdram U3(
     .Clk               (ext_mem_clk),
@@ -543,18 +843,29 @@ sdram U3(
     .Sdr_rd_dout       (Sdr_rd_dout)
 );
 
-// ===================== 音频：WAV 音源（ASRC 到 48k）+ I2S 发射（WAV 优先，回退测试音） =====================
-// WAV 样本重采样（audio_mclk 域，读 sd_card_bmp 内 sd_card_wav 的跨时钟 FIFO）
+// ===================== 音频：WAV / 视频音轨（ASRC 到 48k）+ I2S 发射 =====================
+// 层3 用视频自带音轨（48kHz 立体声，步进 2^32 即 1:1），其余层用 WAV
+assign aud_sel_m  = vid_layer_m;
+assign aud_data   = aud_sel_m ? egv_afifo_data  : wav_fifo_rd_data;
+assign aud_empty  = aud_sel_m ? egv_afifo_empty : wav_fifo_empty;
+assign aud_active = aud_sel_m | wav_active;
+assign aud_step   = aud_sel_m ? 33'h1_0000_0000 : wav_rate_step;
+assign aud_stereo = aud_sel_m ? 1'b1 : wav_stereo;
+assign aud_pause  = aud_sel_m ? ~vid_aud_arm_m : ctrl_audio_pause;
+
+assign wav_fifo_rd_en = aud_rden & ~aud_sel_m;
+assign egv_afifo_rden = aud_rden &  aud_sel_m;
+
 wav_i2s_source u_wav_i2s_source (
     .I_mclk       (audio_mclk),
     .I_rst        (rst_all),
-    .fifo_rd_en   (wav_fifo_rd_en),
-    .fifo_rd_data (wav_fifo_rd_data),
-    .fifo_empty   (wav_fifo_empty),
-    .i_active     (wav_active),
-    .i_pause      (ctrl_audio_pause),
-    .i_step       (wav_rate_step),
-    .i_stereo     (wav_stereo),
+    .fifo_rd_en   (aud_rden),
+    .fifo_rd_data (aud_data),
+    .fifo_empty   (aud_empty),
+    .i_active     (aud_active),
+    .i_pause      (aud_pause),
+    .i_step       (aud_step),
+    .i_stereo     (aud_stereo),
     .o_valid      (wav_src_valid),
     .o_l          (wav_src_l),
     .o_r          (wav_src_r)
@@ -566,11 +877,11 @@ hdmi_audio_tone_i2s_64fs #(
 ) u_hdmi_audio_tone_i2s_64fs (
     .I_mclk      (audio_mclk),
     .I_rst       (rst_all),
-    .I_wav_sel   (wav_active),
+    .I_wav_sel   (aud_active),
     .I_wav_valid (wav_src_valid),
     .I_wav_l     (wav_src_l),
     .I_wav_r     (wav_src_r),
-    .I_pause     (ctrl_audio_pause),
+    .I_pause     (aud_pause),
     .O_i2s_BCLK  (audio_i2s_bclk),
     .O_i2s_LRCK  (audio_i2s_lrck),
     .O_i2s_DOUT  (audio_i2s_dout)

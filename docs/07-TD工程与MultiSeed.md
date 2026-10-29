@@ -69,9 +69,9 @@ ERROR: phy_1 exit with code -1073741819
 
 - `phy_1` 状态显示 `MultiSeed running`
 - 生成 `phy_1/seed_2/settings.cfg`，其中含 `set seed 2`
-- 约 6 分钟完成：place ≈52s、route ≈4m39s、fix_hold ≈20s、bitgen ≈7s
+- 约 2 分钟完成：place ≈34s、route ≈54s、fix_hold ≈4s、bitgen ≈2s（面积降到 85.6% 后）
 - 最佳结果复制到 `phy_1/best_result/`
-- 本次结果：Setup +320ps / Hold +24ps / 0 FEPs，93.50% slices（LUT 14831 / 75.67%）
+- 最近结果（2026-10-29）：seed 2 Setup +557ps / Hold +21ps / 0 FEPs，8385 slices（85.56%）；seed 3 +277ps / +22ps
 
 ### 3.3 完成后的检查
 
@@ -98,10 +98,22 @@ ERROR: phy_1 exit with code -1073741819
 
 - 复制 `settings.cfg`、`HDMI1.4b_Transmitter_v1.0.prj` 到临时目录
 - 综合：`DefaultFlow.tcl`，`start_step read_design`，`end_step opt_gate`
-- 物理：`start_step opt_place`，`end_step bitgen`，`parent ../syn_1`
-- 在物理 `settings.cfg` 中加入 `set phyWildParams {place seed 2}`
+- 物理：`start_step opt_place`，`end_step bitgen`，`parent ../syn_v6`；用 `MultiSeed.tcl` 而不是 `DefaultFlow.tcl`（后者 route 阶段需要 `arr_filter/arr_cong/arr_pwns/arr_rwns`，缺了会报 `can't read "arr_filter"`）
+- 物理 `settings.cfg` 需要 `set seed N` 与 `set drHoldFix on`（单独 fix_hold，绕开内建 hold fix 崩溃）
 
-该方案已产出过 +162ps / +3ps 的 bit（md5 `4bb81ba6...`），仅作为交叉验证；**正式出包仍以官方 GUI Multi-Seed 为准**。
+实际命令：
+
+```bash
+# 综合
+cd src/td_project/check_Runs/syn_v6
+/d/TD/bin/td_commands_prompt.exe /d/TD/doc/scripts/DefaultFlow.tcl
+
+# 布局布线（每个 seed 一个目录）
+cd ../phy_v6/seed_2
+/d/TD/bin/td_commands_prompt.exe /d/TD/doc/scripts/MultiSeed.tcl
+```
+
+该方案已多次产出 0 违例 bit（2026-10-29 seed 2 为 +557ps / +21ps）；**正式出包仍以官方 GUI Multi-Seed 为准**。
 
 ## 6. 重建检查清单
 

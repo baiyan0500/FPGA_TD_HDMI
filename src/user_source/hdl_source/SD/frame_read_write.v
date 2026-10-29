@@ -69,8 +69,8 @@ module frame_read_write
 	input[1:0]                       write_addr_index,           // select valid base address from write_addr_0 write_addr_1 write_addr_2 write_addr_3
 	input[ADDR_BITS - 1:0]           write_len,                  // data write module write request data length
 	input                            write_en,                   // data write module write request for one data
-	input[WRITE_DATA_BITS - 1:0]     write_data                 // write data
-
+	input[WRITE_DATA_BITS - 1:0]     write_data,                // write data
+	input                            i_vflip                    // 1=按 WRITE_V_FLIP 翻转（BMP）；0=顺序写（视频）
 );
 wire[BURST_BITS - 1:0]                           wrusedw;                    // write used words
 wire[BURST_BITS - 1:0]                           rdusedw;                    // read used words
@@ -136,6 +136,7 @@ frame_fifo_write_m0
 	.write_addr_3               (write_addr_3             ),
 	.write_addr_index           (write_addr_index         ),    
 	.write_len                  (write_len                ),
+	.i_vflip                    (i_vflip                  ),
 	.fifo_aclr                  (write_fifo_aclr          ),
 	.rdusedw                 	(rdusedw                  )
 );

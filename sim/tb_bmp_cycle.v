@@ -32,6 +32,7 @@ module tb_bmp_cycle;
     reg         fade_swap = 0;
     wire        fade_req;
     wire [23:0] shown_bcd;
+    wire        load_busy_ext;
     wire        write_req, write_en;
     wire [31:0] write_data;
     wire        SD_nCS, SD_DCLK, SD_MOSI;
@@ -60,6 +61,7 @@ module tb_bmp_cycle;
         .rst               (rst),
         .key_next          (key_next),
         .key_auto          (key_auto),
+        .i_next_en         (1'b1),
         .bmp_width         (16'd640),
         .bmp_height        (16'd480),
         .display_valid     (display_valid),
@@ -91,7 +93,14 @@ module tb_bmp_cycle;
         .wav_rd_clk        (clk),
         .wav_fifo_rd_en    (wav_fifo_rd_en),
         .wav_fifo_rd_data  (wav_fifo_rd_data),
-        .wav_fifo_empty    (wav_fifo_empty)
+        .wav_fifo_empty    (wav_fifo_empty),
+        .i_video_play      (1'b0),
+        .i_egv_sd_read     (1'b0),
+        .i_egv_sd_addr     (32'd0),
+        .o_cli_data_valid  (),
+        .o_cli_data        (),
+        .o_cli_read_end    (),
+        .o_load_busy       (load_busy_ext)
     );
 
     // ---------------- 帧写模型（frame_fifo_write / SDRAM 行为级）----------------

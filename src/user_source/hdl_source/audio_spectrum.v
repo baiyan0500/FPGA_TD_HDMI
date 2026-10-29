@@ -80,16 +80,44 @@ localparam M_OUT  = 2'd2;   // 窗口结束：逐频段算 |X|² 并输出
 localparam M_CLR  = 2'd3;   // 清零状态寄存器，进入下一窗
 
 reg [1:0]  mst;
-reg [2:0]  phase;           // MAC: 0=读 1=乘 2=写回；OUT: 0~7
+reg [2:0]  phase;           // MAC: 0=地址稳定 1=乘 2=写回；OUT: 0=地址稳定 1~7
 reg [4:0]  b_idx;
 reg [10:0] n_cnt;
 reg signed [15:0] x;
-reg signed [27:0] s1 [0:NB-1];
-reg signed [27:0] s2 [0:NB-1];
-reg signed [27:0] s1_d, s2_d;
 reg signed [43:0] prod;
 
-wire signed [27:0] mac_sum = x + (prod >>> 13) - s2_d;
+// Goertzel 状态 s1/s2 放 BRAM：32×28bit×2 组寄存器要吃掉 1792 个触发器（≈1/6 个器件），
+// 换成两块 9K BRAM 后片内只剩读写地址/数据通路，时序与面积都宽松得多
+wire signed [27:0] s1_do, s2_do;
+wire signed [27:0] mac_sum = x + (prod >>> 13) - s2_do;
+wire               s1_we = (mst == M_MAC && phase == 3'd2) || (mst == M_CLR);
+wire signed [27:0] s1_wdata = (mst == M_CLR) ? 28'sd0 : mac_sum;
+
+EG_LOGIC_BRAM #(
+    .DATA_WIDTH_A(28), .ADDR_WIDTH_A(5), .DATA_WIDTH_B(28), .ADDR_WIDTH_B(5),
+    .MODE("DP"), .REGMODE_A("NOREG"), .REGMODE_B("NOREG"),
+    .WRITEMODE_A("NORMAL"), .WRITEMODE_B("NORMAL"),
+    .RESETMODE("SYNC"), .IMPLEMENT("9K")
+) u_s1_ram (
+    .dia(s1_wdata), .addra(b_idx), .cea(1'b1), .ocea(1'b1),
+    .clka(I_clk), .wea(s1_we), .rsta(1'b0), .bea(1'b1),
+    .dib(28'd0), .addrb(5'd0), .ceb(1'b0), .oceb(1'b1),
+    .clkb(I_clk), .web(1'b0), .rstb(1'b0), .beb(1'b1),
+    .doa(s1_do), .dob()
+);
+
+EG_LOGIC_BRAM #(
+    .DATA_WIDTH_A(28), .ADDR_WIDTH_A(5), .DATA_WIDTH_B(28), .ADDR_WIDTH_B(5),
+    .MODE("DP"), .REGMODE_A("NOREG"), .REGMODE_B("NOREG"),
+    .WRITEMODE_A("NORMAL"), .WRITEMODE_B("NORMAL"),
+    .RESETMODE("SYNC"), .IMPLEMENT("9K")
+) u_s2_ram (
+    .dia(s1_do), .addra(b_idx), .cea(1'b1), .ocea(1'b1),
+    .clka(I_clk), .wea(s1_we), .rsta(1'b0), .bea(1'b1),
+    .dib(28'd0), .addrb(5'd0), .ceb(1'b0), .oceb(1'b1),
+    .clkb(I_clk), .web(1'b0), .rstb(1'b0), .beb(1'b1),
+    .doa(s2_do), .dob()
+);
 
 // |X|² 计算（状态量右移 10 位后平方）
 reg signed [15:0] coef_d;
@@ -106,8 +134,6 @@ wire [6:0]  lv_scaled = (amp_log > 6'd12) ?
                         (({1'b0, amp_log} - 7'd12) << 2) : 7'd0;
 wire [5:0]  lv_new = (lv_scaled > 7'd63) ? 6'd63 : lv_scaled[5:0];
 
-integer k;
-
 always @(posedge I_clk or posedge I_rst) begin
     if (I_rst) begin
         mst     <= M_IDLE;
@@ -115,8 +141,6 @@ always @(posedge I_clk or posedge I_rst) begin
         b_idx   <= 5'd0;
         n_cnt   <= 11'd0;
         x       <= 16'sd0;
-        s1_d    <= 28'sd0;
-        s2_d    <= 28'sd0;
         prod    <= 44'sd0;
         coef_d  <= 16'sd0;
         sa      <= 18'sd0;
@@ -127,10 +151,6 @@ always @(posedge I_clk or posedge I_rst) begin
         cab     <= 52'sd0;
         pwr     <= 38'sd0;
         o_level <= 192'd0;
-        for (k = 0; k < NB; k = k + 1) begin
-            s1[k] <= 28'sd0;
-            s2[k] <= 28'sd0;
-        end
     end else begin
         case (mst)
             M_IDLE: begin
@@ -144,18 +164,14 @@ always @(posedge I_clk or posedge I_rst) begin
 
             M_MAC: begin
                 case (phase)
-                    3'd0: begin
-                        s1_d  <= s1[b_idx];       // 读 s1/s2
-                        s2_d  <= s2[b_idx];
+                    3'd0: begin               // 地址=b_idx，BRAM 输出下一拍有效
                         phase <= 3'd1;
                     end
                     3'd1: begin
-                        prod  <= coef_lut(b_idx) * s1_d;   // 乘系数
+                        prod  <= coef_lut(b_idx) * s1_do;   // s1_do = s1[b_idx]
                         phase <= 3'd2;
                     end
-                    default: begin
-                        s2[b_idx] <= s1_d;        // 写回递推结果
-                        s1[b_idx] <= mac_sum;
+                    default: begin            // 写回：s1<=mac_sum, s2<=s1_do（见 s1_we）
                         phase <= 3'd0;
                         if (b_idx == NB - 1) begin
                             b_idx <= 5'd0;
@@ -174,16 +190,14 @@ always @(posedge I_clk or posedge I_rst) begin
 
             M_OUT: begin
                 case (phase)
-                    3'd0: begin
-                        s1_d   <= s1[b_idx];
-                        s2_d   <= s2[b_idx];
-                        coef_d <= coef_lut(b_idx);
+                    3'd0: begin               // 地址=b_idx，BRAM 输出下一拍有效
                         phase  <= 3'd1;
                     end
                     3'd1: begin
-                        sa    <= s1_d >>> 10;
-                        sb    <= s2_d >>> 10;
-                        phase <= 3'd2;
+                        sa     <= s1_do >>> 10;
+                        sb     <= s2_do >>> 10;
+                        coef_d <= coef_lut(b_idx);
+                        phase  <= 3'd2;
                     end
                     3'd2: begin
                         sq1   <= sa * sa;
@@ -208,23 +222,23 @@ always @(posedge I_clk or posedge I_rst) begin
                     default: begin
                         o_level[b_idx*6 +: 6] <= lv_new;
                         phase <= 3'd0;
-                        if (b_idx == NB - 1)
-                            mst <= M_CLR;
-                        else
+                        if (b_idx == NB - 1) begin
+                            b_idx <= 5'd0;
+                            mst   <= M_CLR;
+                        end else
                             b_idx <= b_idx + 5'd1;
                     end
                 endcase
             end
 
+            // BRAM 版清零：逐地址写 0（32 拍，每窗一次，开销可忽略）
             M_CLR: begin
-                for (k = 0; k < NB; k = k + 1) begin
-                    s1[k] <= 28'sd0;
-                    s2[k] <= 28'sd0;
+                b_idx <= (b_idx == NB - 1) ? 5'd0 : b_idx + 5'd1;
+                if (b_idx == NB - 1) begin
+                    n_cnt <= 11'd0;
+                    phase <= 3'd0;
+                    mst   <= M_IDLE;
                 end
-                n_cnt <= 11'd0;
-                b_idx <= 5'd0;
-                phase <= 3'd0;
-                mst   <= M_IDLE;
             end
 
             default: mst <= M_IDLE;

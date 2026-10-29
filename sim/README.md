@@ -20,6 +20,11 @@
 | `tb_spectrum.v` | `audio_spectrum` | 1kHz 频段定位 |
 | `tb_font.v` | `font8x8` | 小写字形非零 |
 | `tb_bmp_cycle.v` | `sd_card_bmp` 整链 | 16 图扫描 + 9 图连续轮播 + WAV 总线竞争无死锁；`+START=<扇区>` 模拟大元数据区（exFAT）、`+DROP=<sector>` 注入丢请求验证看门狗恢复 |
+| `tb_egv_reader.v` | `egv_reader` | 段表跨段换算、视频/音频字节拆分、末帧停机与重启（需 `+incdir+.../video`） |
+| `tb_video_frame_fill.v` | `video_frame_fill` | 2 倍放大、296 行写入、双 bank 切换与首帧初始化（依赖 `eg_logic_bram_sim.v`） |
+| `tb_egv_audio_fifo.v` | `egv_audio_fifo` | 字节流重排为 s16 立体声、FWFT 读、flush |
+| `tb_danmaku_osd.v` | `danmaku_osd` | 两轨道排队、逐字变色、滚完才消失 |
+| `tb_resmon_osd.v` | `resmon_osd` | 面板边框、占用条长度、百分比与信息行 |
 
 ## 运行方式
 
@@ -63,4 +68,12 @@ vsim -c -do "run -all; quit" work.tb_bmp_cycle \
 
 注意：`tb_bmp_cycle.v` 末尾自带行为级 `sd_card_top`（同名），编译时不要再加入 `SD/sd_card_top.v`，否则会覆盖模型。`key_press_debounce` 定义在 `SD/sd_card_bmp.v` 内，`tb_ctrl` 需要一并编译。
 
-> 本次整理未重新运行全部 TB；最近一次 WAV 修复后的 `tb_wav_path` 已通过。结果记录见 [验证记录](../docs/05-验证记录.md)。
+> 2026-10-29 复跑：`tb_ctrl`、`tb_slogan`、`tb_danmaku_osd`、`tb_resmon_osd`、`tb_video_frame_fill`、`tb_egv_audio_fifo`、`tb_egv_reader`、`tb_osd_layer`、`tb_spectrum`、`tb_bmp_cycle`（6 图 + 12 次切换）全部 PASS。结果记录见 [验证记录](../docs/05-验证记录.md)。
+
+视频相关用例需要额外文件：
+
+```bash
+vlog eg_logic_bram_sim.v ../src/user_source/hdl_source/video/video_frame_fill.v tb_video_frame_fill.v
+vlog +incdir+../src/user_source/hdl_source/video ../src/user_source/hdl_source/video/egv_reader.v tb_egv_reader.v
+vlog eg_logic_bram_sim.v ../src/user_source/hdl_source/video/egv_audio_fifo.v tb_egv_audio_fifo.v
+```

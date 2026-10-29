@@ -37,6 +37,7 @@ module frame_fifo_write
 	input[ADDR_BITS - 1:0]           write_addr_3,               // data write module write request base address 1, used when write_addr_index = 3
 	input[1:0]                       write_addr_index,           // select valid base address from write_addr_0 write_addr_1 write_addr_2 write_addr_3
 	input[ADDR_BITS - 1:0]           write_len,                  // data write module write request data length
+	input                            i_vflip,                    // 1=按 WRITE_V_FLIP 翻转（BMP 自下而上）；0=顺序写（视频自顶向下）
 	output reg                       fifo_aclr,                  // to fifo asynchronous clear
 	input[9:0]                      rdusedw                     // from fifo read used words
 );
@@ -71,6 +72,7 @@ reg[1:0]                            write_addr_index_d1;
 reg[3:0]                            state;                       //state machine
 reg [ADDR_BITS - 1:0]	 App_wr_addr_r;
 reg [15:0]                            wr_x;                       // current x position in one input row
+reg                                   vflip_r;                    // S_ACK 时锁存的翻转使能
 
 reg [BURST_BITS - 1:0]				burst_cnt;
 wire								wr_burst_finish;
@@ -155,18 +157,19 @@ begin
 		if(state == S_ACK)
 			begin
 				wr_x <= 16'd0;
+				vflip_r <= WRITE_V_FLIP && i_vflip;
 				if(write_addr_index_d1 == 2'd0)
-					App_wr_addr_r <= WRITE_V_FLIP ? (write_addr_0 + VFLIP_FIRST_ADDR_OFFSET) : write_addr_0;
+					App_wr_addr_r <= (WRITE_V_FLIP && i_vflip) ? (write_addr_0 + VFLIP_FIRST_ADDR_OFFSET) : write_addr_0;
 				else if(write_addr_index_d1 == 2'd1)
-					App_wr_addr_r <= WRITE_V_FLIP ? (write_addr_1 + VFLIP_FIRST_ADDR_OFFSET) : write_addr_1;
+					App_wr_addr_r <= (WRITE_V_FLIP && i_vflip) ? (write_addr_1 + VFLIP_FIRST_ADDR_OFFSET) : write_addr_1;
 				else if(write_addr_index_d1 == 2'd2)
-					App_wr_addr_r <= WRITE_V_FLIP ? (write_addr_2 + VFLIP_FIRST_ADDR_OFFSET) : write_addr_2;
+					App_wr_addr_r <= (WRITE_V_FLIP && i_vflip) ? (write_addr_2 + VFLIP_FIRST_ADDR_OFFSET) : write_addr_2;
 				else if(write_addr_index_d1 == 2'd3)
-					App_wr_addr_r <= WRITE_V_FLIP ? (write_addr_3 + VFLIP_FIRST_ADDR_OFFSET) : write_addr_3;
+					App_wr_addr_r <= (WRITE_V_FLIP && i_vflip) ? (write_addr_3 + VFLIP_FIRST_ADDR_OFFSET) : write_addr_3;
 			end
 		else if(App_wr_en)
 			begin
-				if(WRITE_V_FLIP)
+				if(vflip_r)
 				begin
 					if(wr_x == VFLIP_LINE_LAST_X)
 					begin

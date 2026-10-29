@@ -36,10 +36,13 @@ module EG_LOGIC_BRAM #(
 );
 
 reg [DATA_WIDTH_A-1:0] mem [0:(1<<ADDR_WIDTH_A)-1];
+integer init_i;
 
 initial begin
     doa = {DATA_WIDTH_A{1'b0}};
     dob = {DATA_WIDTH_B{1'b0}};
+    for (init_i = 0; init_i < (1<<ADDR_WIDTH_A); init_i = init_i + 1)
+        mem[init_i] = {DATA_WIDTH_A{1'b0}};   // 与 FPGA 上电 BRAM 全零一致
 end
 
 always @(posedge clka) begin

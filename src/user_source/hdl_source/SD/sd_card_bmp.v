@@ -9,6 +9,7 @@ module sd_card_bmp #(
     input                       rst,
     input                       key_next,
     input                       key_auto,
+    input                       i_next_en,        // 层1 才允许 KEY2 手动切图
     input  [15:0]               bmp_width,
     input  [15:0]               bmp_height,
     output reg                  display_valid,
@@ -47,7 +48,16 @@ module sd_card_bmp #(
     input                       wav_rd_clk,       // FIFO 读时钟（audio_mclk 12.288MHz）
     input                       wav_fifo_rd_en,   // FIFO 读使能（audio_mclk 域）
     output      [15:0]          wav_fifo_rd_data, // FIFO 读数据（FWFT）
-    output                      wav_fifo_empty    // FIFO 空标志
+    output                      wav_fifo_empty,    // FIFO 空标志
+
+    // ---- 视频客户端（SW3 层）----
+    input                       i_video_play,     // 视频模式：BMP 装载停、WAV 让出总线
+    input                       i_egv_sd_read,
+    input  [31:0]               i_egv_sd_addr,
+    output                      o_cli_data_valid,
+    output [7:0]                o_cli_data,
+    output                      o_cli_read_end,
+    output                      o_load_busy
 );
 
 wire key_next_press;
@@ -89,14 +99,21 @@ reg  [1:0]       wav_pause_sync;
 reg              grant_wav;
 reg              bmp_rd_busy;
 reg              wav_rd_busy;
-wire             want_wav = wav_bus_req;
-wire             bmp_data_valid_g = !grant_wav && sd_sec_read_data_valid;
-wire             bmp_read_end_g   = !grant_wav && sd_sec_read_end;
-wire             sd_sec_read_mux  = grant_wav ? wav_sd_read : sd_sec_read;
-wire [31:0]      sd_sec_addr_mux  = grant_wav ? wav_sd_addr  : sd_sec_read_addr;
+wire             want_wav = wav_bus_req && !i_video_play;
+wire             egv_owns = i_video_play;
+wire             bmp_data_valid_g = !grant_wav && !egv_owns && sd_sec_read_data_valid;
+wire             bmp_read_end_g   = !grant_wav && !egv_owns && sd_sec_read_end;
+wire             sd_sec_read_mux  = grant_wav ? wav_sd_read :
+                                    (egv_owns ? i_egv_sd_read : sd_sec_read);
+wire [31:0]      sd_sec_addr_mux  = grant_wav ? wav_sd_addr :
+                                    (egv_owns ? i_egv_sd_addr : sd_sec_read_addr);
 // WAV 客户端数据/结束信号按 grant 门控分发（此前缺失驱动导致 wav_rd_busy 永不清零、总线锁死）
 assign wav_data_valid = grant_wav && sd_sec_read_data_valid;
 assign wav_read_end   = grant_wav && sd_sec_read_end;
+// 视频客户端独占（grant_wav 在 i_video_play 时无法拉起）
+assign o_cli_data_valid = !grant_wav && egv_owns && sd_sec_read_data_valid;
+assign o_cli_data       = sd_sec_read_data;
+assign o_cli_read_end   = !grant_wav && egv_owns && sd_sec_read_end;
 
 reg              scan_start_pulse;
 reg              load_start_pulse;
@@ -129,6 +146,9 @@ reg [17:0]       img_sector14;
 reg [17:0]       img_sector15;
 reg              next_req_pending;
 reg              load_busy;
+
+assign o_load_busy = load_busy;
+
 reg [31:0]       load_timeout_cnt;
 
 reg              load_abort;
@@ -142,6 +162,14 @@ reg              load_active_seen;     // bmp_read 已真正离开 IDLE（装载
 reg              wr_req_seen;          // 本次装载已发出 write_req（header 匹配过）
 reg [3:0]        fail_idx;             // 最近一次装载失败的图片索引
 reg              fail_valid;           // fail_idx 有效：下次切图从它的下一张继续尝试
+
+// 装载候选：把“下一张索引 → 扇区查表”拆成两级寄存。原来 fail_valid 一拍内要走
+// 5 位加法 + 16 选 1 的 32 位查表 + 装载选择，100MHz 下组合延迟 >11ns
+reg [3:0]        cand_idx;
+reg [31:0]       cand_sector;
+reg [1:0]        cand_buf;
+reg [2:0]        cand_idle;            // 空闲拍数：保证候选值在发起装载前已稳定
+wire             cand_ok = cand_idle[2];
 
 // WAV 总线授予看门狗：正常一次补水（最多 3 个扇区）约 0.5ms，超过 1.5ms
 // 视为在途标志卡死（sd_sec_read 撤销早于 SD 核采样会丢掉请求），强制收回总线
@@ -346,6 +374,22 @@ function [1:0] next_buf_lut;
             next_buf_lut = 2'd0;
     end
 endfunction
+
+// 候选流水：fail_valid/img_idx → 索引，再一级 → 扇区查表。
+// 输入只在装载结束（load_busy 下降）时变化，空闲 3 拍后候选值必定有效
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        cand_idx    <= 4'd0;
+        cand_sector <= 32'd0;
+        cand_buf    <= 2'd0;
+        cand_idle   <= 3'b000;
+    end else begin
+        cand_idx    <= next_from_current;
+        cand_sector <= sector_lut(cand_idx);
+        cand_buf    <= next_buf_lut(disp_buf_idx, display_valid);
+        cand_idle   <= {cand_idle[1:0], ~load_busy};
+    end
+end
 
 always @(posedge clk or posedge rst) begin
     if (rst) begin
@@ -575,7 +619,7 @@ always @(posedge clk or posedge rst) begin
                 write_done_seen       <= 1'b0;
             end else begin
                 // 忙的时候也只记 1 次“下一张”请求，不会累积成连跳两张
-                if (key_next_press && scan_done && (img_found_count != 5'd0))
+                if (key_next_press && i_next_en && scan_done && (img_found_count != 5'd0))
                     next_req_pending <= 1'b1;
 
                 // 自动播放开/关（电平控制，来自 ctrl 的 o_auto_play）
@@ -594,9 +638,9 @@ always @(posedge clk or posedge rst) begin
                 end
 
                 // 首图自动加载到 buffer0（若首图坏则沿 fail 链继续尝试后续图片）
-                if (scan_done && !first_image_committed && bmp_ready && !load_busy && (img_found_count != 5'd0)) begin
-                    load_idx         <= fail_valid ? next_from_current : 4'd0;
-                    load_sector      <= fail_valid ? sector_lut(next_from_current) : img_sector0;
+                if (scan_done && !first_image_committed && bmp_ready && !load_busy && !i_video_play && (img_found_count != 5'd0) && cand_ok) begin
+                    load_idx         <= fail_valid ? cand_idx : 4'd0;
+                    load_sector      <= fail_valid ? cand_sector : {14'd0, img_sector0};
                     pending_buf_idx  <= 2'd0;
                     write_buf_idx    <= 2'd0;
                     load_start_pulse <= 1'b1;
@@ -610,11 +654,11 @@ always @(posedge clk or posedge rst) begin
                     auto_cnt         <= 32'd0;
                 end
                 // 手动下一张优先：写到“非当前显示”的另一块 buffer
-                else if (scan_done && bmp_ready && display_valid && !load_busy && next_req_pending && (img_found_count != 5'd0)) begin
-                    load_idx         <= next_from_current;
-                    load_sector      <= sector_lut(next_from_current);
-                    pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
-                    write_buf_idx    <= next_buf_lut(disp_buf_idx, display_valid);
+                else if (scan_done && bmp_ready && display_valid && !load_busy && !i_video_play && next_req_pending && (img_found_count != 5'd0) && cand_ok) begin
+                    load_idx         <= cand_idx;
+                    load_sector      <= cand_sector;
+                    pending_buf_idx  <= cand_buf;
+                    write_buf_idx    <= cand_buf;
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
@@ -626,11 +670,11 @@ always @(posedge clk or posedge rst) begin
                     auto_cnt         <= 32'd0;
                 end
                 // 自动播放下一张：同样写到“非当前显示”的另一块 buffer
-                else if (scan_done && bmp_ready && display_valid && !load_busy && auto_play_en && auto_tick && (img_found_count > 5'd1)) begin
-                    load_idx         <= next_from_current;
-                    load_sector      <= sector_lut(next_from_current);
-                    pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
-                    write_buf_idx    <= next_buf_lut(disp_buf_idx, display_valid);
+                else if (scan_done && bmp_ready && display_valid && !load_busy && !i_video_play && auto_play_en && auto_tick && (img_found_count > 5'd1) && cand_ok) begin
+                    load_idx         <= cand_idx;
+                    load_sector      <= cand_sector;
+                    pending_buf_idx  <= cand_buf;
+                    write_buf_idx    <= cand_buf;
                     load_start_pulse <= 1'b1;
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
@@ -680,7 +724,7 @@ bmp_read bmp_read_m0(
     .bmp_data               (bmp_data),
     .src_width              (src_width),
     .src_height             (src_height),
-    .i_stall                (scale_almost_full | want_wav)
+    .i_stall                (scale_almost_full | want_wav | i_video_play)
 );
 
 scaler u_scaler(
@@ -728,7 +772,7 @@ sd_card_wav #(
     .i_scan_done            (scan_done),
     .i_wav_found            (wav_found),
     .i_wav_start_sector     (wav_start_sector),
-    .i_pause                (wav_pause_s),
+    .i_pause                (wav_pause_s | i_video_play),
     .o_bus_req              (wav_bus_req),
     .i_bus_grant            (grant_wav),
     .sd_sec_read            (wav_sd_read),

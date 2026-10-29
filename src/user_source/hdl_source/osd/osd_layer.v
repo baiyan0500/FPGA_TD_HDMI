@@ -1,14 +1,19 @@
 // ============================================================================
 // osd_layer — 字符 OSD 叠加层（单级流水）
 //
-// 正常显示：顶部标语 + 时间戳、底部信息栏、VU 电平条、32 段频谱。
+// 正常显示：顶部标语 + 时间戳、底部信息栏（含百分比亮度/对比度）、
+//           VU 电平条、32 段全宽透明频谱、彩色弹幕、资源占用面板。
 // 启动阶段（首图提交前）：左面板标题/跑马灯/进度，右面板按键功能说明。
-// 顶/底栏布局与显示逻辑保持不变；标语仅显示 ASCII 可打印字符，避免乱码。
-// 字库 font8x8：正常文本 2x，开机标题 4x，功能说明 1x。
+//
+// 全层共用一套 font8x8 字库（优先级选择字符），避免 4 份 ROM 复制。
 // ============================================================================
 module osd_layer #(
     parameter H_ACTIVE = 640,
-    parameter V_ACTIVE = 480
+    parameter V_ACTIVE = 480,
+    parameter integer RM_LUT_PCT = 74,
+    parameter integer RM_FF_PCT  = 44,
+    parameter integer RM_RAM_PCT = 84,
+    parameter integer RM_DSP_PCT = 66
 )(
     input  wire        i_clk,      // video_clk 25MHz
     input  wire        i_rst,      // 高有效复位
@@ -17,25 +22,38 @@ module osd_layer #(
     input  wire        i_de,
     input  wire [23:0] i_rgb,
     input  wire [1:0]  i_mode,     // 转场模式 0~3
-    input  wire [2:0]  i_bright,   // 亮度档 0~4
+    input  wire [2:0]  i_bright,   // 亮度档 0~4（显示为 20%~100%）
     input  wire [2:0]  i_contrast, // 对比度档 0~4
-    input  wire [255:0] i_slogan,      // 标语内容（32 字节，标语[0]在最高字节）
-    input  wire [5:0]  i_slogan_len,   // 标语长度 0~32
-    input  wire        i_slogan_dir,   // 滚动方向 0=从右向左 1=从左往右
-    input  wire        i_slogan_update,// 更新 toggle（内容变化时翻转）
-    input  wire        i_slogan_scroll,// 滚动使能
-    input  wire        i_audio_viz,    // 音频可视化使能
-    input  wire [7:0]  i_audio_level,  // 音频电平 0~255
-    input  wire        i_spectrum_en,  // 频谱图显示使能（层3 K4）
-    input  wire [191:0] i_spec_level,  // 32 频段 × 6bit 电平
-    input  wire        i_display_valid,// 首图已提交（隐藏启动面板）
+    input  wire [255:0] i_slogan,
+    input  wire [5:0]  i_slogan_len,
+    input  wire        i_slogan_dir,
+    input  wire        i_slogan_update,
+    input  wire        i_slogan_scroll,
+
+    input  wire [1:0]  i_viz_mode,   // 层2：0 关 / 1 音量 / 2 音量+频谱
+    input  wire        i_spec_en,    // 层3：频谱开关
+    input  wire [7:0]  i_audio_level,
+    input  wire [191:0] i_spec_level,// 32 频段 × 6bit
+
+    input  wire        i_dm_en,      // 层3：弹幕
+    input  wire [191:0] i_dm_text,
+    input  wire [4:0]  i_dm_len,
+    input  wire [3:0]  i_dm_color,
+    input  wire        i_dm_tgl,
+    output wire        o_dm_ack,
+
+    input  wire        i_rm_en,      // 层3：资源面板
+    input  wire        i_video_on,
+    input  wire        i_vid_ftgl,   // 每出一帧视频翻转一次（100MHz 域）
+
+    input  wire        i_display_valid,   // 首图已提交（隐藏启动面板）
     input  wire        i_sd_init_done,
     input  wire        i_scan_done,
-    input  wire [4:0]  i_img_count,    // 扫描到的图片数（0~16）
-    input  wire [15:0] i_src_w_bcd,    // 当前显示图源宽 BCD（100MHz 域，配 i_src_tgl）
+    input  wire [4:0]  i_img_count,
+    input  wire [15:0] i_src_w_bcd,
     input  wire [15:0] i_src_h_bcd,
     input  wire        i_src_tgl,
-    input  wire        i_auto_play,    // 自动轮播状态
+    input  wire        i_auto_play,
 
     output reg         o_hs,
     output reg         o_vs,
@@ -43,7 +61,7 @@ module osd_layer #(
     output reg  [23:0] o_rgb
 );
 
-    // ---- 上下栏布局（保持不变）----
+    // ---- 上下栏布局 ----
     localparam CHAR_W  = 16;
     localparam CHAR_H  = 16;
     localparam BAR_H   = 24;
@@ -58,14 +76,14 @@ module osd_layer #(
     localparam [10:0] BOT_Y       = V_ACTIVE - BAR_H;               // 456
     localparam [10:0] BOT_GLYPH_Y = BOT_Y + (BAR_H - CHAR_H) / 2;   // 460
     localparam [10:0] BOT_X       = 11'd8;
-    localparam [5:0]  BOT_LEN     = 6'd38;          // 源尺寸标注(17) + FPS/状态(21)
+    localparam [5:0]  BOT_LEN     = 6'd37;      // 源尺寸(0..17) + FPS/M/B/C(18..36)
 
     // ---- 像素位置跟踪 ----
     reg [10:0] x;
     reg [10:0] y;
     reg        de_d;
     reg        vs_d;
-    wire       de_rise = i_de & ~de_d;
+    wire       de_fall = ~i_de & de_d;
     wire       vs_rise = i_vs & ~vs_d;
 
     always @(posedge i_clk or posedge i_rst) begin
@@ -74,8 +92,9 @@ module osd_layer #(
         end else begin
             de_d <= i_de;
             vs_d <= i_vs;
+            // 行号在行末（de 下降沿）进位，保证整行像素用同一行号
             if (vs_rise)      y <= 11'd0;
-            else if (de_rise) y <= y + 11'd1;
+            else if (de_fall) y <= y + 11'd1;
             if (!i_de) x <= 11'd0;
             else       x <= x + 11'd1;
         end
@@ -137,8 +156,15 @@ module osd_layer #(
     wire [6:0] fps_tens_char = 7'h30 + (fps_val / 10);
     wire [6:0] fps_ones_char = 7'h30 + (fps_val % 10);
 
+    // ---- 亮度/对比度百分比（20/40/60/80/100）----
+    wire [4:0] pct_tens_b5 = {1'b0, i_bright,   1'b0} + 5'd2;   // 2*(档+1)
+    wire [4:0] pct_tens_c5 = {1'b0, i_contrast, 1'b0} + 5'd2;
+    wire [6:0] b_hc = (i_bright   == 3'd4) ? 7'h31 : 7'h20;
+    wire [6:0] c_hc = (i_contrast == 3'd4) ? 7'h31 : 7'h20;
+    wire [6:0] b_tc = (i_bright   == 3'd4) ? 7'h30 : {3'h3, pct_tens_b5[3:0]};
+    wire [6:0] c_tc = (i_contrast == 3'd4) ? 7'h30 : {3'h3, pct_tens_c5[3:0]};
+
     // ---- 当前显示图的源尺寸（100MHz 域 BCD + toggle 握手）----
-    // 底栏标注 "1024x577>640x480"；源图本身就是 640x480 时只显示 "640x480"
     reg  [2:0]  src_tgl_sync;
     wire        src_tgl_edge = src_tgl_sync[2] ^ src_tgl_sync[1];
     reg  [15:0] src_w_bcd_q;
@@ -159,7 +185,6 @@ module osd_layer #(
         end
     end
 
-    // 底栏四位 BCD 去前导零：高到低依次判断，直到遇到非零位才显示
     wire [3:0] src_w3 = src_w_bcd_q[15:12];
     wire [3:0] src_w2 = src_w_bcd_q[11:8];
     wire [3:0] src_w1 = src_w_bcd_q[7:4];
@@ -186,6 +211,36 @@ module osd_layer #(
     // ---- 图片数两位十进制（0~16）----
     wire [3:0] img_cnt_tens = i_img_count / 5'd10;
     wire [3:0] img_cnt_ones = i_img_count % 5'd10;
+
+    // ---- 视频帧号 BCD（每出一帧 +1，20bit = 5 位）----
+    reg  [1:0]  vid_tgl_sync;
+    wire        vid_ftgl_edge = vid_tgl_sync[0] ^ vid_tgl_sync[1];
+    reg  [19:0] vid_bcd;
+    wire [3:0]  vd0 = vid_bcd[3:0];
+    wire [3:0]  vd1 = vid_bcd[7:4];
+    wire [3:0]  vd2 = vid_bcd[11:8];
+    wire [3:0]  vd3 = vid_bcd[15:12];
+    wire [3:0]  vd4 = vid_bcd[19:16];
+    wire c0 = (vd0 == 4'd9);
+    wire c1 = (vd1 == 4'd9) & c0;
+    wire c2 = (vd2 == 4'd9) & c1;
+    wire c3 = (vd3 == 4'd9) & c2;
+
+    always @(posedge i_clk or posedge i_rst) begin
+        if (i_rst) begin
+            vid_tgl_sync <= 2'd0;
+            vid_bcd      <= 20'd0;
+        end else begin
+            vid_tgl_sync <= {vid_tgl_sync[0], i_vid_ftgl};
+            if (vid_ftgl_edge) begin
+                vid_bcd[3:0]   <= c0 ? 4'd0 : vd0 + 4'd1;
+                vid_bcd[7:4]   <= c0 ? (c1 ? 4'd0 : vd1 + 4'd1) : vd1;
+                vid_bcd[11:8]  <= c1 ? (c2 ? 4'd0 : vd2 + 4'd1) : vd2;
+                vid_bcd[15:12] <= c2 ? (c3 ? 4'd0 : vd3 + 4'd1) : vd3;
+                vid_bcd[19:16] <= c3 ? ((vd4 == 4'd9) ? 4'd0 : vd4 + 4'd1) : vd4;
+            end
+        end
+    end
 
     // ---- 标语锁存（跨域）+ 平滑滚动 ----
     reg [7:0] slogan [0:31];
@@ -241,7 +296,7 @@ module osd_layer #(
         end
     end
 
-    // ---- 顶部标语几何（ASCII 过滤，防中文/UTF-8 乱码）----
+    // ---- 顶部标语几何（ASCII 过滤）----
     wire in_bar = (y < BAR_H);
 
     wire [10:0] title_off   = x - TITLE_X;
@@ -307,7 +362,6 @@ module osd_layer #(
     always @(*) begin
         bot_char = 7'h20;
         if (bot_idx <= 6'd17) begin
-            // 左段：源尺寸 → 输出尺寸标注
             if (!src_known) begin
                 bot_char = 7'h20;
             end else if (src_native) begin
@@ -344,27 +398,27 @@ module osd_layer #(
                 endcase
             end
         end else begin
-            // 右段：60FPS MOD:0 B:2 C:2（固定从第 18 个字符开始）
+            // 右段：60F M:0 B100% C100%（18..36）
             case (bot_idx)
                 6'd18: bot_char = fps_tens_char;
                 6'd19: bot_char = fps_ones_char;
                 6'd20: bot_char = "F";
-                6'd21: bot_char = "P";
-                6'd22: bot_char = "S";
-                6'd23: bot_char = " ";
-                6'd24: bot_char = "M";
-                6'd25: bot_char = "O";
-                6'd26: bot_char = "D";
-                6'd27: bot_char = ":";
-                6'd28: bot_char = {3'h3, 2'b00, i_mode};
-                6'd29: bot_char = " ";
-                6'd30: bot_char = "B";
-                6'd31: bot_char = ":";
-                6'd32: bot_char = {3'h3, 1'b0, i_bright};
-                6'd33: bot_char = " ";
-                6'd34: bot_char = "C";
-                6'd35: bot_char = ":";
-                6'd36: bot_char = {3'h3, 1'b0, i_contrast};
+                6'd21: bot_char = " ";
+                6'd22: bot_char = "M";
+                6'd23: bot_char = ":";
+                6'd24: bot_char = {3'h3, 2'b00, i_mode};
+                6'd25: bot_char = " ";
+                6'd26: bot_char = "B";
+                6'd27: bot_char = b_hc;
+                6'd28: bot_char = b_tc;
+                6'd29: bot_char = "0";
+                6'd30: bot_char = "%";
+                6'd31: bot_char = " ";
+                6'd32: bot_char = "C";
+                6'd33: bot_char = c_hc;
+                6'd34: bot_char = c_tc;
+                6'd35: bot_char = "0";
+                6'd36: bot_char = "%";
                 default: bot_char = 7'h20;
             endcase
         end
@@ -373,7 +427,6 @@ module osd_layer #(
     // ======================= 启动界面 =======================
     wire boot_mode = ~i_display_valid;
 
-    // 跑马灯相位（每帧步进）
     reg [9:0] mq_phase;
     always @(posedge i_clk or posedge i_rst) begin
         if (i_rst) mq_phase <= 10'd0;
@@ -382,7 +435,7 @@ module osd_layer #(
 
     // ---- 文字常量表 ----
     // sid: 0=FPGA DISPLAY, 1=SYSTEM, 2=SWITCH FUNCTIONS, 3=CONTROLS,
-    //      4=STATUS, 5=EG4S20 HDMI PLAYER, 6=MODE/B/C 模板, 7=FOUND 模板
+    //      4=STATUS, 5=EG4S20 HDMI PLAYER, 6=FOUND IMAGES
     function [6:0] fixed_char;
         input [2:0] sid;
         input [4:0] idx;
@@ -482,37 +535,6 @@ module osd_layer #(
                         5'd15: fixed_char = "Y";
                         5'd16: fixed_char = "E";
                         5'd17: fixed_char = "R";
-                        default: fixed_char = 7'h20;
-                    endcase
-                end
-                3'd6: begin
-                    case (idx)
-                        5'd0:  fixed_char = "M";
-                        5'd1:  fixed_char = "O";
-                        5'd2:  fixed_char = "D";
-                        5'd3:  fixed_char = "E";
-                        5'd4:  fixed_char = ":";
-                        5'd5:  fixed_char = " ";
-                        5'd6:  fixed_char = " ";
-                        5'd7:  fixed_char = "B";
-                        5'd8:  fixed_char = "R";
-                        5'd9:  fixed_char = "I";
-                        5'd10: fixed_char = "G";
-                        5'd11: fixed_char = "H";
-                        5'd12: fixed_char = "T";
-                        5'd13: fixed_char = ":";
-                        5'd14: fixed_char = " ";
-                        5'd15: fixed_char = " ";
-                        5'd16: fixed_char = "C";
-                        5'd17: fixed_char = "O";
-                        5'd18: fixed_char = "N";
-                        5'd19: fixed_char = "T";
-                        5'd20: fixed_char = "R";
-                        5'd21: fixed_char = "A";
-                        5'd22: fixed_char = "S";
-                        5'd23: fixed_char = "T";
-                        5'd24: fixed_char = ":";
-                        5'd25: fixed_char = " ";
                         default: fixed_char = 7'h20;
                     endcase
                 end
@@ -682,7 +704,7 @@ module osd_layer #(
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd2: begin   //  K3 CONTRAST  K4 BRIGHT
+                4'd2: begin   //  K3 CONTRAST K4 BRIGHT
                     case (col)
                         5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
@@ -729,7 +751,7 @@ module osd_layer #(
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd4: begin   //  K1 MODE  K3 AUTOPLAY
+                4'd4: begin   //  K1 MODE  K2 AUTOPLAY
                     case (col)
                         5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
@@ -742,7 +764,7 @@ module osd_layer #(
                         5'd8:  guide_char = " ";
                         5'd9:  guide_char = " ";
                         5'd10: guide_char = "K";
-                        5'd11: guide_char = "3";
+                        5'd11: guide_char = "2";
                         5'd12: guide_char = " ";
                         5'd13: guide_char = "A";
                         5'd14: guide_char = "U";
@@ -755,16 +777,38 @@ module osd_layer #(
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd5: begin   // SW3 AUDIO LAYER
+                4'd5: begin   //  K3 AUDIO K4 VIZ
                     case (col)
-                        5'd0:  guide_char = "S";
-                        5'd1:  guide_char = "W";
+                        5'd0:  guide_char = " ";
+                        5'd1:  guide_char = "K";
                         5'd2:  guide_char = "3";
                         5'd3:  guide_char = " ";
                         5'd4:  guide_char = "A";
                         5'd5:  guide_char = "U";
                         5'd6:  guide_char = "D";
                         5'd7:  guide_char = "I";
+                        5'd8:  guide_char = "O";
+                        5'd9:  guide_char = " ";
+                        5'd10: guide_char = " ";
+                        5'd11: guide_char = "K";
+                        5'd12: guide_char = "4";
+                        5'd13: guide_char = " ";
+                        5'd14: guide_char = "V";
+                        5'd15: guide_char = "I";
+                        5'd16: guide_char = "Z";
+                        default: guide_char = 7'h20;
+                    endcase
+                end
+                4'd6: begin   // SW3 VIDEO LAYER
+                    case (col)
+                        5'd0:  guide_char = "S";
+                        5'd1:  guide_char = "W";
+                        5'd2:  guide_char = "3";
+                        5'd3:  guide_char = " ";
+                        5'd4:  guide_char = "V";
+                        5'd5:  guide_char = "I";
+                        5'd6:  guide_char = "D";
+                        5'd7:  guide_char = "E";
                         5'd8:  guide_char = "O";
                         5'd9:  guide_char = " ";
                         5'd10: guide_char = "L";
@@ -775,85 +819,52 @@ module osd_layer #(
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd6: begin   //  K1 AUDIO  K3 VU METER
+                4'd7: begin   //  K1 PLAY K2 DANMAKU
                     case (col)
                         5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
                         5'd2:  guide_char = "1";
                         5'd3:  guide_char = " ";
-                        5'd4:  guide_char = "A";
-                        5'd5:  guide_char = "U";
-                        5'd6:  guide_char = "D";
-                        5'd7:  guide_char = "I";
-                        5'd8:  guide_char = "O";
+                        5'd4:  guide_char = "P";
+                        5'd5:  guide_char = "L";
+                        5'd6:  guide_char = "A";
+                        5'd7:  guide_char = "Y";
+                        5'd8:  guide_char = " ";
                         5'd9:  guide_char = " ";
-                        5'd10: guide_char = " ";
-                        5'd11: guide_char = "K";
-                        5'd12: guide_char = "3";
-                        5'd13: guide_char = " ";
-                        5'd14: guide_char = "V";
-                        5'd15: guide_char = "U";
-                        5'd16: guide_char = " ";
-                        5'd17: guide_char = "M";
-                        5'd18: guide_char = "E";
-                        5'd19: guide_char = "T";
-                        5'd20: guide_char = "E";
-                        5'd21: guide_char = "R";
+                        5'd10: guide_char = "K";
+                        5'd11: guide_char = "2";
+                        5'd12: guide_char = " ";
+                        5'd13: guide_char = "D";
+                        5'd14: guide_char = "A";
+                        5'd15: guide_char = "N";
+                        5'd16: guide_char = "M";
+                        5'd17: guide_char = "A";
+                        5'd18: guide_char = "K";
+                        5'd19: guide_char = "U";
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd7: begin   //  K4 SPECTRUM  SW4:RSVD
+                default: begin // K3 SPEC K4 RESMON
                     case (col)
                         5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
-                        5'd2:  guide_char = "4";
+                        5'd2:  guide_char = "3";
                         5'd3:  guide_char = " ";
                         5'd4:  guide_char = "S";
                         5'd5:  guide_char = "P";
                         5'd6:  guide_char = "E";
                         5'd7:  guide_char = "C";
-                        5'd8:  guide_char = "T";
-                        5'd9:  guide_char = "R";
-                        5'd10: guide_char = "U";
-                        5'd11: guide_char = "M";
+                        5'd8:  guide_char = " ";
+                        5'd9:  guide_char = " ";
+                        5'd10: guide_char = "K";
+                        5'd11: guide_char = "4";
                         5'd12: guide_char = " ";
-                        5'd13: guide_char = " ";
-                        5'd14: guide_char = "S";
-                        5'd15: guide_char = "W";
-                        5'd16: guide_char = "4";
-                        5'd17: guide_char = ":";
-                        5'd18: guide_char = "R";
-                        5'd19: guide_char = "S";
-                        5'd20: guide_char = "V";
-                        5'd21: guide_char = "D";
-                        default: guide_char = 7'h20;
-                    endcase
-                end
-                default: begin // K2 NEXT IMAGE ANY LAYER
-                    case (col)
-                        5'd0:  guide_char = "K";
-                        5'd1:  guide_char = "2";
-                        5'd2:  guide_char = " ";
-                        5'd3:  guide_char = "N";
-                        5'd4:  guide_char = "E";
-                        5'd5:  guide_char = "X";
-                        5'd6:  guide_char = "T";
-                        5'd7:  guide_char = " ";
-                        5'd8:  guide_char = "I";
-                        5'd9:  guide_char = "M";
-                        5'd10: guide_char = "A";
-                        5'd11: guide_char = "G";
-                        5'd12: guide_char = "E";
-                        5'd13: guide_char = " ";
-                        5'd14: guide_char = "A";
-                        5'd15: guide_char = "N";
-                        5'd16: guide_char = "Y";
-                        5'd17: guide_char = " ";
-                        5'd18: guide_char = "L";
-                        5'd19: guide_char = "A";
-                        5'd20: guide_char = "Y";
-                        5'd21: guide_char = "E";
-                        5'd22: guide_char = "R";
+                        5'd13: guide_char = "R";
+                        5'd14: guide_char = "E";
+                        5'd15: guide_char = "S";
+                        5'd16: guide_char = "M";
+                        5'd17: guide_char = "O";
+                        5'd18: guide_char = "N";
                         default: guide_char = 7'h20;
                     endcase
                 end
@@ -861,73 +872,67 @@ module osd_layer #(
         end
     endfunction
 
-    // 右面板实时状态（3 行 × 16 字符）
+    // 右面板实时状态（3 行 × 16 字符，B/C 以百分比显示）
     function [6:0] stat_char;
         input [1:0] line;
         input [4:0] col;
         begin
             stat_char = 7'h20;
             case (line)
-                2'd0: begin   // MODE:0  B:4  C:4
+                2'd0: begin   // M:0 B100% C100%
                     case (col)
                         5'd0:  stat_char = "M";
-                        5'd1:  stat_char = "O";
-                        5'd2:  stat_char = "D";
-                        5'd3:  stat_char = "E";
-                        5'd4:  stat_char = ":";
-                        5'd5:  stat_char = {3'h3, 2'b00, i_mode};
-                        5'd6:  stat_char = " ";
-                        5'd7:  stat_char = " ";
-                        5'd8:  stat_char = "B";
-                        5'd9:  stat_char = ":";
-                        5'd10: stat_char = {3'h3, 1'b0, i_bright};
-                        5'd11: stat_char = " ";
-                        5'd12: stat_char = " ";
-                        5'd13: stat_char = "C";
-                        5'd14: stat_char = ":";
-                        5'd15: stat_char = {3'h3, 1'b0, i_contrast};
+                        5'd1:  stat_char = ":";
+                        5'd2:  stat_char = {3'h3, 2'b00, i_mode};
+                        5'd3:  stat_char = " ";
+                        5'd4:  stat_char = "B";
+                        5'd5:  stat_char = b_hc;
+                        5'd6:  stat_char = b_tc;
+                        5'd7:  stat_char = "0";
+                        5'd8:  stat_char = "%";
+                        5'd9:  stat_char = " ";
+                        5'd10: stat_char = "C";
+                        5'd11: stat_char = c_hc;
+                        5'd12: stat_char = c_tc;
+                        5'd13: stat_char = "0";
+                        5'd14: stat_char = "%";
                         default: stat_char = 7'h20;
                     endcase
                 end
-                2'd1: begin   // AUTO:OFF  VU:OFF
+                2'd1: begin   // AUTO:ON  VIZ:2
                     case (col)
                         5'd0:  stat_char = "A";
                         5'd1:  stat_char = "U";
                         5'd2:  stat_char = "T";
                         5'd3:  stat_char = "O";
                         5'd4:  stat_char = ":";
-                        5'd5:  stat_char = "O";
-                        5'd6:  stat_char = i_auto_play ? "N" : "F";
-                        5'd7:  stat_char = i_auto_play ? " " : "F";
+                        5'd5:  stat_char = i_auto_play ? "N" : "F";
+                        5'd6:  stat_char = i_auto_play ? " " : "F";
+                        5'd7:  stat_char = " ";
                         5'd8:  stat_char = " ";
-                        5'd9:  stat_char = " ";
-                        5'd10: stat_char = "V";
-                        5'd11: stat_char = "U";
+                        5'd9:  stat_char = "V";
+                        5'd10: stat_char = "I";
+                        5'd11: stat_char = "Z";
                         5'd12: stat_char = ":";
-                        5'd13: stat_char = "O";
-                        5'd14: stat_char = i_audio_viz ? "N" : "F";
-                        5'd15: stat_char = i_audio_viz ? " " : "F";
+                        5'd13: stat_char = {3'h3, 1'b0, i_viz_mode};
                         default: stat_char = 7'h20;
                     endcase
                 end
-                default: begin // SPEC:OFF  IMG:0
+                default: begin // DM:OFF VD:STOP
                     case (col)
-                        5'd0:  stat_char = "S";
-                        5'd1:  stat_char = "P";
-                        5'd2:  stat_char = "E";
-                        5'd3:  stat_char = "C";
-                        5'd4:  stat_char = ":";
-                        5'd5:  stat_char = "O";
-                        5'd6:  stat_char = i_spectrum_en ? "N" : "F";
-                        5'd7:  stat_char = i_spectrum_en ? " " : "F";
-                        5'd8:  stat_char = " ";
-                        5'd9:  stat_char = " ";
-                        5'd10: stat_char = "I";
-                        5'd11: stat_char = "M";
-                        5'd12: stat_char = "G";
-                        5'd13: stat_char = ":";
-                        5'd14: stat_char = (img_cnt_tens == 4'd0) ? 7'h20 : {3'h3, img_cnt_tens};
-                        5'd15: stat_char = {3'h3, img_cnt_ones};
+                        5'd0:  stat_char = "D";
+                        5'd1:  stat_char = "M";
+                        5'd2:  stat_char = ":";
+                        5'd3:  stat_char = i_dm_en ? "N" : "F";
+                        5'd4:  stat_char = i_dm_en ? " " : "F";
+                        5'd5:  stat_char = " ";
+                        5'd6:  stat_char = "V";
+                        5'd7:  stat_char = "D";
+                        5'd8:  stat_char = ":";
+                        5'd9:  stat_char = i_video_on ? "R" : "S";
+                        5'd10: stat_char = i_video_on ? "U" : "T";
+                        5'd11: stat_char = i_video_on ? "N" : "O";
+                        5'd12: stat_char = i_video_on ? " " : "P";
                         default: stat_char = 7'h20;
                     endcase
                 end
@@ -983,7 +988,7 @@ module osd_layer #(
                           (i_img_count == 5'd0) ? 2'd3 :
                                                   2'd2;
 
-    // ---- 左面板：x8..408, y80..392，3px 跑马灯边框 ----
+    // ---- 左面板：x8..408, y80..392 ----
     localparam [10:0] LP_X0 = 11'd8;
     localparam [10:0] LP_X1 = 11'd408;
     localparam [10:0] LP_Y0 = 11'd80;
@@ -1006,7 +1011,7 @@ module osd_layer #(
         endcase
     end
 
-    // 标题："FPGA DISPLAY" / "SYSTEM"（4x）
+    // 标题（4x）
     localparam [10:0] T1_X = 11'd16;
     localparam [10:0] T1_Y = 11'd120;
     wire [10:0] t1_off = x - T1_X;
@@ -1038,7 +1043,7 @@ module osd_layer #(
     wire in_bst = boot_mode && (x >= BST_X) && (x < BST_X + 11'd288) &&
                   (y >= BST_Y) && (y < BST_Y + 11'd16);
 
-    // "FOUND IMAGES: n"（2x）
+    // FOUND IMAGES（2x）
     localparam [10:0] FND_X = 11'd88;
     localparam [10:0] FND_Y = 11'd256;
     wire [10:0] fnd_off = x - FND_X;
@@ -1049,15 +1054,15 @@ module osd_layer #(
     wire in_fnd = boot_mode && (x >= FND_X) && (x < FND_X + 11'd240) &&
                   (y >= FND_Y) && (y < FND_Y + 11'd16);
 
-    // "MODE:0 BRIGHT:4 CONTRAST:4"（1x）
-    localparam [10:0] CFG_X = 11'd104;
+    // "M:0 B100% C100%"（1x）
+    localparam [10:0] CFG_X = 11'd148;
     localparam [10:0] CFG_Y = 11'd292;
     wire [10:0] cfg_off = x - CFG_X;
     wire [4:0]  cfg_idx = cfg_off[7:3];
     wire [2:0]  cfg_col = cfg_off[2:0];
     wire [10:0] cfg_v   = y - CFG_Y;
     wire [2:0]  cfg_row = cfg_v[2:0];
-    wire in_cfg = boot_mode && (x >= CFG_X) && (x < CFG_X + 11'd208) &&
+    wire in_cfg = boot_mode && (x >= CFG_X) && (x < CFG_X + 11'd120) &&
                   (y >= CFG_Y) && (y < CFG_Y + 11'd8);
 
     // 进度条
@@ -1082,7 +1087,7 @@ module osd_layer #(
     wire in_ftr = boot_mode && (x >= FTR_X) && (x < FTR_X + 11'd144) &&
                   (y >= FTR_Y) && (y < FTR_Y + 11'd8);
 
-    // ---- 右面板：x416..624, y80..392，2px 边框 ----
+    // ---- 右面板：x416..624, y80..392 ----
     localparam [10:0] RP_X0 = 11'd416;
     localparam [10:0] RP_X1 = 11'd624;
     localparam [10:0] RP_Y0 = 11'd80;
@@ -1118,7 +1123,7 @@ module osd_layer #(
     wire in_rhdiv = (y >= 11'd124) && (y < 11'd126) &&
                     (x >= 11'd418) && (x < 11'd622);
 
-    // 按键说明（1x，9 行，16px 行距，仅每行前 8px 出字）
+    // 按键说明（1x，9 行，16px 行距）
     localparam [10:0] GD_X = 11'd432;
     localparam [10:0] GD_Y = 11'd134;
     wire [10:0] gd_offx = x - GD_X;
@@ -1154,7 +1159,7 @@ module osd_layer #(
     wire in_st = boot_mode && (x >= ST_X) && (x < ST_X + 11'd128) &&
                  (y >= ST_Y) && (y < ST_Y + 11'd48) && ~st_offy[3];
 
-    // ---- 启动界面字符选择（共享一套字库）----
+    // ---- 启动界面字符选择 ----
     reg [6:0]  boot_char;
     reg [2:0]  boot_row;
     reg [2:0]  boot_col;
@@ -1192,17 +1197,29 @@ module osd_layer #(
             else if (fnd_idx == 5'd14)
                 boot_char = {3'h3, img_cnt_ones};
             else
-                boot_char = fixed_char(3'd7, fnd_idx);
+                boot_char = fixed_char(3'd6, fnd_idx);
             boot_row  = fnd_row;
             boot_col  = fnd_col;
             boot_text_on = 1'b1;
             boot_text_color = 24'h8CFFB0;
         end else if (in_cfg) begin
             case (cfg_idx)
-                5'd5:  boot_char = {3'h3, 2'b00, i_mode};
-                5'd14: boot_char = {3'h3, 1'b0, i_bright};
-                5'd25: boot_char = {3'h3, 1'b0, i_contrast};
-                default: boot_char = fixed_char(3'd6, cfg_idx);
+                5'd0:  boot_char = "M";
+                5'd1:  boot_char = ":";
+                5'd2:  boot_char = {3'h3, 2'b00, i_mode};
+                5'd3:  boot_char = " ";
+                5'd4:  boot_char = "B";
+                5'd5:  boot_char = b_hc;
+                5'd6:  boot_char = b_tc;
+                5'd7:  boot_char = "0";
+                5'd8:  boot_char = "%";
+                5'd9:  boot_char = " ";
+                5'd10: boot_char = "C";
+                5'd11: boot_char = c_hc;
+                5'd12: boot_char = c_tc;
+                5'd13: boot_char = "0";
+                5'd14: boot_char = "%";
+                default: boot_char = 7'h20;
             endcase
             boot_row  = cfg_row;
             boot_col  = cfg_col;
@@ -1250,7 +1267,6 @@ module osd_layer #(
     // ---- 32 段频谱平滑 + 峰值保持 ----
     reg [5:0] bar_lvl [0:31];
     reg [5:0] bar_pk  [0:31];
-    reg [5:0] pk_hold [0:31];
     integer   bi;
     reg [5:0] nl;
 
@@ -1259,7 +1275,6 @@ module osd_layer #(
             for (bi = 0; bi < 32; bi = bi + 1) begin
                 bar_lvl[bi] <= 6'd0;
                 bar_pk[bi]  <= 6'd0;
-                pk_hold[bi] <= 6'd0;
             end
         end else if (vs_rise) begin
             for (bi = 0; bi < 32; bi = bi + 1) begin
@@ -1269,91 +1284,157 @@ module osd_layer #(
                 else if (bar_lvl[bi] > 6'd0)
                     bar_lvl[bi] <= bar_lvl[bi] - 6'd1;
 
-                if (nl >= bar_pk[bi]) begin
-                    bar_pk[bi]  <= nl;
-                    pk_hold[bi] <= 6'd24;
-                end else if (pk_hold[bi] > 6'd0) begin
-                    pk_hold[bi] <= pk_hold[bi] - 6'd1;
-                end else if (bar_pk[bi] > 6'd0) begin
+                if (nl >= bar_pk[bi])
+                    bar_pk[bi] <= nl;
+                else if (bar_pk[bi] > 6'd0)
                     bar_pk[bi] <= bar_pk[bi] - 6'd1;
-                end
             end
         end
     end
 
-    // ---- 频谱绘制：面板 x56..584, y316..456，柱区 512px ----
-    localparam [10:0] SP_X0 = 11'd56;
-    localparam [10:0] SP_X1 = 11'd584;
-    localparam [10:0] SP_Y0 = 11'd316;
-    localparam [10:0] SP_Y1 = 11'd456;
+    // ---- 全宽透明频谱：x0..640，柱底 y=456，32 段 × 20px ----
+    // band = (x*13)>>8 近似 x/20；列内相位 frac<200 为柱体（约 16px 宽）
+    wire [15:0] sx13 = ({5'd0, x} << 3) + ({5'd0, x} << 2) + {5'd0, x};
+    wire [4:0]  s_band_raw = sx13[12:8];
+    wire [4:0]  s_band = (s_band_raw > 5'd31) ? 5'd31 : s_band_raw;
+    wire        s_col_on = (sx13[7:0] < 8'd200);
 
-    wire spec_en = ~boot_mode && i_spectrum_en;
-    wire in_spec_panel = spec_en && (x >= SP_X0) && (x < SP_X1) &&
-                         (y >= SP_Y0) && (y < SP_Y1);
-    wire spec_border = in_spec_panel &&
-                       ((x == SP_X0) || (x == SP_X1 - 11'd1) ||
-                        (y == SP_Y0) || (y == SP_Y1 - 11'd1));
+    wire [5:0]  s_lvl = bar_lvl[s_band];
+    wire [5:0]  s_pk  = bar_pk[s_band];
+    wire [8:0]  s_h   = {1'b0, s_lvl, 2'b00};        // ×4
+    wire [8:0]  s_ph  = {1'b0, s_pk,  2'b00};
+    wire [9:0]  s_sy  = 10'd456 - y;                 // 柱底向上计数
 
-    wire [10:0] bar_sx = x - 11'd64;
-    wire [4:0]  spec_band = bar_sx[8:4];
-    wire [3:0]  spec_col  = bar_sx[3:0];
-    wire [10:0] spec_sy11 = 11'd451 - y;
-    wire [7:0]  spec_sy   = spec_sy11[7:0];
-    wire spec_in_bars = (x >= 11'd64) && (x < 11'd576) &&
-                        (y >= 11'd324) && (y < 11'd452);
+    wire spec_on   = ~boot_mode && ((i_viz_mode == 2'd2) || i_spec_en);
+    wire spec_zone = spec_on && (y >= 11'd204) && (y < 11'd456) && s_col_on;
+    wire spec_bar  = spec_zone && (s_sy <= s_h);
+    wire spec_peak = spec_zone && (s_pk != 6'd0) && (s_sy > s_h) &&
+                     ((s_sy == s_ph) || (s_sy == s_ph + 9'd1));
 
-    wire [5:0] cur_lvl = bar_lvl[spec_band];
-    wire [5:0] cur_pk  = bar_pk[spec_band];
-    wire [7:0] cur_h   = {1'b0, cur_lvl, 1'b0};
-    wire [7:0] pk_h    = {1'b0, cur_pk, 1'b0};
-    wire bar_pix  = spec_in_bars && (spec_col < 4'd14) && (spec_sy < cur_h);
-    wire peak_pix = spec_in_bars && (spec_col < 4'd14) && (cur_pk != 6'd0) &&
-                    ((spec_sy + 8'd1 == pk_h) || (spec_sy + 8'd2 == pk_h));
+    wire [23:0] spec_color = (s_sy >= 10'd192) ? 24'hFF3860 :
+                             (s_sy >= 10'd128) ? 24'hFFC93C :
+                             (s_sy >= 10'd64)  ? 24'h5CFF7A :
+                                                 24'h28C8FF;
 
-    wire [23:0] spec_color = (spec_sy >= 8'd96) ? 24'hFF3860 :
-                             (spec_sy >= 8'd64) ? 24'hFFC93C :
-                             (spec_sy >= 8'd32) ? 24'h5CFF7A :
-                                                  24'h28C8FF;
-    wire [23:0] spec_bg = ((x[4:0] == 5'd0) || (y[3:0] == 4'd0)) ?
-                          24'h101A2C : 24'h080A12;
-
-    // ---- VU 电平条（保持原位置）----
+    // ---- VU 电平条 ----
     localparam [10:0] AV_X = 11'd160;
     localparam [10:0] AV_Y = 11'd216;
     localparam [10:0] AV_W = 11'd320;
     localparam [10:0] AV_H = 11'd24;
     wire [16:0] av_prod = {9'd0, i_audio_level} * 11'd320;
     wire [9:0]  av_len  = av_prod[15:8];
-    wire in_av = ~boot_mode && i_audio_viz &&
+    wire in_av = ~boot_mode && (i_viz_mode != 2'd0) &&
                  (x >= AV_X) && (x < AV_X + AV_W) &&
                  (y >= AV_Y) && (y < AV_Y + AV_H);
     wire in_av_bar = in_av && (x < AV_X + {1'b0, av_len});
     wire [23:0] av_color = (x >= AV_X + {1'b0, av_len[9:1]}) ?
                             24'hFFD166 : 24'h39D98A;
 
-    // ---- 字库 ROM ----
-    wire [7:0] title_glyph;
-    wire [7:0] ts_glyph;
-    wire [7:0] bot_glyph;
-    wire [7:0] boot_glyph;
-    font8x8 u_font_title (
-        .i_char (title_char), .i_row (title_row), .o_row (title_glyph)
-    );
-    font8x8 u_font_ts (
-        .i_char (ts_char), .i_row (ts_row), .o_row (ts_glyph)
-    );
-    font8x8 u_font_bot (
-        .i_char (bot_char), .i_row (bot_row), .o_row (bot_glyph)
-    );
-    font8x8 u_font_boot (
-        .i_char (boot_char), .i_row (boot_row), .o_row (boot_glyph)
+    // ======================= 弹幕 =======================
+    wire        dm_txt_on;
+    wire [6:0]  dm_char;
+    wire [2:0]  dm_row, dm_col;
+    wire [23:0] dm_color;
+
+    danmaku_osd u_danmaku (
+        .i_clk        (i_clk),
+        .i_rst        (i_rst),
+        .i_frame_tick (vs_rise),
+        .i_x          (x),
+        .i_y          (y),
+        .i_en         (i_dm_en && ~boot_mode),
+        .i_text       (i_dm_text),
+        .i_len        (i_dm_len),
+        .i_color      (i_dm_color),
+        .i_tgl        (i_dm_tgl),
+        .o_ack        (o_dm_ack),
+        .o_txt_on     (dm_txt_on),
+        .o_char       (dm_char),
+        .o_row        (dm_row),
+        .o_col        (dm_col),
+        .o_color      (dm_color)
     );
 
-    // ---- 文本像素判定 ----
-    wire title_pixel = in_title && title_glyph[7 - title_col];
-    wire ts_pixel    = in_ts    && ts_glyph[7 - ts_col];
-    wire bot_pixel   = in_bot   && bot_glyph[7 - bot_col];
-    wire boot_pixel  = boot_text_on && boot_glyph[7 - boot_col];
+    // ======================= 资源占用面板 =======================
+    wire        rm_txt_on;
+    wire [6:0]  rm_char;
+    wire [2:0]  rm_row, rm_col;
+    wire [23:0] rm_color;
+    wire        rm_bg_on;
+    wire [23:0] rm_bg_color;
+
+    resmon_osd #(
+        .LUT_PCT (RM_LUT_PCT),
+        .FF_PCT  (RM_FF_PCT),
+        .RAM_PCT (RM_RAM_PCT),
+        .DSP_PCT (RM_DSP_PCT)
+    ) u_resmon (
+        .i_clk       (i_clk),
+        .i_rst       (i_rst),
+        .i_x         (x),
+        .i_y         (y),
+        .i_en        (i_rm_en && ~boot_mode),
+        .i_frame_bcd (vid_bcd),
+        .i_video_on  (i_video_on),
+        .o_txt_on    (rm_txt_on),
+        .o_char      (rm_char),
+        .o_row       (rm_row),
+        .o_col       (rm_col),
+        .o_color     (rm_color),
+        .o_bg_on     (rm_bg_on),
+        .o_bg_color  (rm_bg_color)
+    );
+
+    // ---- 统一字符源（优先级：顶栏 > 底栏 > 弹幕 > 资源面板 > 启动面板）----
+    localparam [2:0] S_NONE = 3'd0, S_BOOT = 3'd1, S_TITLE = 3'd2,
+                     S_TS   = 3'd3, S_BOT  = 3'd4, S_DM    = 3'd5,
+                     S_RM   = 3'd6;
+
+    reg [2:0]  t_src;
+    reg [6:0]  t_char;
+    reg [2:0]  t_row;
+    reg [2:0]  t_col;
+    reg [23:0] t_color;
+
+    always @(*) begin
+        t_src   = S_NONE;
+        t_char  = 7'h20;
+        t_row   = 3'd0;
+        t_col   = 3'd0;
+        t_color = 24'hFFFFFF;
+        if (in_title) begin
+            t_src = S_TITLE; t_char = title_char; t_row = title_row;
+            t_col = title_col; t_color = 24'hFFFFFF;
+        end else if (in_ts) begin
+            t_src = S_TS; t_char = ts_char; t_row = ts_row;
+            t_col = ts_col; t_color = 24'hFFFFFF;
+        end else if (in_bot) begin
+            t_src = S_BOT; t_char = bot_char; t_row = bot_row;
+            t_col = bot_col; t_color = 24'hFFFFFF;
+        end else if (dm_txt_on) begin
+            t_src = S_DM; t_char = dm_char; t_row = dm_row;
+            t_col = dm_col; t_color = dm_color;
+        end else if (rm_txt_on) begin
+            t_src = S_RM; t_char = rm_char; t_row = rm_row;
+            t_col = rm_col; t_color = rm_color;
+        end else if (boot_text_on) begin
+            t_src = S_BOOT; t_char = boot_char; t_row = boot_row;
+            t_col = boot_col; t_color = boot_text_color;
+        end
+    end
+
+    // ---- 共享字库 ROM ----
+    wire [7:0] glyph;
+    font8x8 u_font (
+        .i_char (t_char), .i_row (t_row), .o_row (glyph)
+    );
+
+    wire t_px    = (t_src != S_NONE) && glyph[7 - t_col];
+    wire boot_px = t_px && (t_src == S_BOOT);
+    wire bar_px  = t_px && ((t_src == S_TITLE) || (t_src == S_TS));
+    wire bot_px  = t_px && (t_src == S_BOT);
+    wire dm_px   = t_px && (t_src == S_DM);
+    wire rm_px   = t_px && (t_src == S_RM);
 
     // ---- 输出混合 ----
     reg [23:0] rgb_next;
@@ -1367,8 +1448,8 @@ module osd_layer #(
                 else               rgb_next = 24'h101A2E;
             end else if (in_div1)
                 rgb_next = 24'h1E4A66;
-            else if (boot_pixel)
-                rgb_next = boot_text_color;
+            else if (boot_px)
+                rgb_next = t_color;
             else
                 rgb_next = 24'h05080F;
         end
@@ -1377,23 +1458,25 @@ module osd_layer #(
         else if (in_rp) begin
             if (in_rhdiv || in_div2)
                 rgb_next = 24'h1E4A66;
-            else if (boot_pixel)
-                rgb_next = boot_text_color;
+            else if (boot_px)
+                rgb_next = t_color;
             else
                 rgb_next = 24'h05080F;
         end
         else if (in_bar)
-            rgb_next = (title_pixel || ts_pixel) ? 24'hFFFFFF : 24'h000000;
+            rgb_next = bar_px ? 24'hFFFFFF : 24'h000000;
         else if (in_bot_bar)
-            rgb_next = bot_pixel ? 24'hFFFFFF : 24'h000000;
+            rgb_next = bot_px ? 24'hFFFFFF : 24'h000000;
+        else if (rm_bg_on)
+            rgb_next = rm_px ? t_color : rm_bg_color;
+        else if (dm_px)
+            rgb_next = t_color;
         else if (in_av)
             rgb_next = in_av_bar ? av_color : 24'h141A24;
-        else if (in_spec_panel) begin
-            if (spec_border)   rgb_next = 24'h2A6A8A;
-            else if (bar_pix)  rgb_next = spec_color;
-            else if (peak_pix) rgb_next = 24'hFFFFFF;
-            else               rgb_next = spec_bg;
-        end
+        else if (spec_bar)
+            rgb_next = spec_color;
+        else if (spec_peak)
+            rgb_next = 24'hFFFFFF;
         else
             rgb_next = i_rgb;
     end
