@@ -12,6 +12,14 @@
 | `2026-10-21_multiseed_seed2_best_result_readMe.txt` | 同上 | best_result 来源说明 |
 | `2026-10-21_check_seed2_route.qor` | 命令行独立复核（check_Runs） | Setup +162ps / Hold +3ps；8814 slices |
 | `2026-10-21_check_seed2_place.qor` | 同上 | place 阶段 QoR |
+| `2026-10-31_wavgv_gate.timing` | check_Runs syn_v8 综合（gate） | Setup -376ps / 14 FEPs、Hold +471ps（P&R 前口径） |
+| `2026-10-31_wavgv_gate.area` | 同上 | LUT 15169 / reg 8961 / BRAM 54 / DSP 19 |
+| `2026-10-31_wavgv_seed2_route.qor` | check_Runs phy_v8 seed 2 | Setup -22ps / 1 FEP，未采用 |
+| `2026-10-31_wavgv_seed3_route.qor` | check_Runs phy_v8 seed 3 | Setup +235ps / Hold +21ps / 0 FEPs；采用 |
+| `2026-10-31_wavgv_seed3_place.qor` | 同上（place 阶段） | place 阶段 QoR |
+| `2026-10-31_wavgv_seed3_flow.status` | 同上 | 最终时序与各阶段耗时 |
+| `2026-10-31_wavgv_seed3_pr.timing` | 同上 | 最终时序明细 |
+| `2026-10-31_wavgv_seed3_phy.area` | 同上 | LUT 15530(79.23%) / reg 9110 / LE 16906(86.26%) / BRAM 54 / DSP 19 |
 
 对应 bit 与 md5 见 [验证记录](../05-验证记录.md) 和 `../../../bitstream/README.md`。
 

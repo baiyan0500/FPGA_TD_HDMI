@@ -12,12 +12,16 @@
 module tb_wav_path;
 
 parameter integer STEREO = 0;
-parameter integer RUN_FRAMES = 2700;      // 覆盖回绕需 > 16384(mono) / 8192(stereo)
+parameter integer BPS    = 16;            // 16/24/32（样本位深）
+parameter integer EXT    = 0;             // 1 = WAVE_FORMAT_EXTENSIBLE（子格式 PCM）
+parameter integer RUN_FRAMES = 2700;
 
 localparam [31:0] SECTOR_BASE = 32'd1000;
-localparam integer DATA_SIZE   = 32768;          // data chunk 字节数
-localparam integer WORDS_TOTAL = DATA_SIZE / 2;  // 16bit 字数
-localparam integer FRAMES_TOTAL = STEREO ? (WORDS_TOTAL/2) : WORDS_TOTAL;
+localparam integer BYTES_PER_SAMPLE = BPS / 8;
+localparam integer CHANNELS = STEREO ? 2 : 1;
+localparam integer DATA_SIZE   = 32760;          // 2/3/4 字节样本都能整除
+localparam integer WORDS_TOTAL = DATA_SIZE / BYTES_PER_SAMPLE;  // FIFO 字数
+localparam integer FRAMES_TOTAL = WORDS_TOTAL / CHANNELS;
 
 reg clk = 0;
 reg mclk = 0;
@@ -92,6 +96,7 @@ wav_i2s_source dut_src (
 // WAV 头：+HDR=0 经典 44 字节；+HDR=1 真实卡布局（fmt16 @12，LIST26 @36，
 // data @70 → payload @78，chunk 起点非 4 字节对齐）；+HDR=2 含奇数长度 chunk
 // （junk size=5 + 1 字节填充）。
+// EXT=1 时 fmt 用 WAVE_FORMAT_EXTENSIBLE（cbSize=22 + 有效位 + 掩码 + PCM GUID）
 // ---------------------------------------------------------------------------
 reg [7:0] hdr [0:1023];
 integer   hdr_len  = 44;
@@ -120,11 +125,12 @@ task build_hdr;
     integer p, k;
     reg [15:0] ch;
     reg [31:0] br;
+    reg [15:0] fmt_size;
     begin
         for (k = 0; k < 1024; k = k + 1) hdr[k] = 8'h00;
         ch = STEREO ? 16'd2 : 16'd1;
-        br = 48000 * ch * 2;
-        wtag(0, "RIFF"); w32(4, 36 + DATA_SIZE); wtag(8, "WAVE");
+        br = 48000 * CHANNELS * BYTES_PER_SAMPLE;
+        wtag(0, "RIFF"); wtag(8, "WAVE");
         p = 12;
         if (hdr_mode == 2) begin           // 奇数长度 chunk + 填充字节
             wtag(p, "junk"); w32(p+4, 32'd5);
@@ -132,10 +138,22 @@ task build_hdr;
             w8(p+11, 8'h22); w8(p+12, 8'h33);
             p = p + 8 + 5 + 1;
         end
-        wtag(p, "fmt "); w32(p+4, 32'd16);
-        w16(p+8, 16'd1); w16(p+10, ch); w32(p+12, 32'd48000);
-        w32(p+16, br); w16(p+20, ch*2); w16(p+22, 16'd16);
-        p = p + 8 + 16;
+        fmt_size = EXT ? 16'd40 : 16'd16;
+        wtag(p, "fmt "); w32(p+4, {16'd0, fmt_size});
+        w16(p+8,  EXT ? 16'hFFFE : 16'd1);   // PCM / EXTENSIBLE
+        w16(p+10, ch); w32(p+12, 32'd48000);
+        w32(p+16, br); w16(p+20, ch*BYTES_PER_SAMPLE); w16(p+22, BPS);
+        if (EXT) begin
+            w16(p+24, 16'd22);               // cbSize
+            w16(p+26, BPS);                  // wValidBitsPerSample
+            w32(p+28, STEREO ? 32'h3 : 32'h4);// dwChannelMask
+            // SubFormat GUID = KSDATAFORMAT_SUBTYPE_PCM
+            w8(p+32,8'h01); w8(p+33,8'h00); w8(p+34,8'h00); w8(p+35,8'h00);
+            w8(p+36,8'h00); w8(p+37,8'h00); w8(p+38,8'h10); w8(p+39,8'h00);
+            w8(p+40,8'h80); w8(p+41,8'h00); w8(p+42,8'h00); w8(p+43,8'hAA);
+            w8(p+44,8'h00); w8(p+45,8'h38); w8(p+46,8'h9B); w8(p+47,8'h71);
+        end
+        p = p + 8 + fmt_size;
         if (hdr_mode >= 1) begin          // LIST/INFO：实际卡上 size=26 的元数据块
             wtag(p, "LIST"); w32(p+4, 32'd26);
             wtag(p+8, "INFO");
@@ -145,27 +163,37 @@ task build_hdr;
         wtag(p, "data"); w32(p+4, DATA_SIZE);
         p = p + 8;
         hdr_len = p;
+        w32(4, hdr_len + DATA_SIZE - 8);   // RIFF size 回填
     end
 endtask
 
+// 数据区：每个样本的末两字节装斜坡（其余字节为 0），保证 FIFO 取高 16bit
+// 后与 16bit 版本逐字相同，从而复用同一套期望序列。
 function [7:0] sec_byte;
     input [31:0] sec;
     input integer i;
-    integer foff, g, w, s, v;
+    integer foff, g, j, lane, fr, v;
     begin
         foff = (sec - SECTOR_BASE) * 512 + i;
         if (foff < hdr_len) begin
             sec_byte = hdr[foff];
         end else begin
-            g = foff - hdr_len;
-            w = g / 2;
+            g    = foff - hdr_len;
+            j    = g / BYTES_PER_SAMPLE;      // 样本序号
+            lane = g % BYTES_PER_SAMPLE;
             if (STEREO) begin
-                s = (w / 2) % FRAMES_TOTAL;
-                v = w[0] ? (30000 - s) : s;
+                fr = (j / 2) % FRAMES_TOTAL;
+                v  = j[0] ? (30000 - fr) : fr;
             end else begin
-                v = w % FRAMES_TOTAL;
+                fr = j % FRAMES_TOTAL;
+                v  = fr;
             end
-            sec_byte = g[0] ? ((v >> 8) & 8'hFF) : (v & 8'hFF);
+            if (lane == BYTES_PER_SAMPLE - 1)
+                sec_byte = (v >> 8) & 8'hFF;
+            else if (lane == BYTES_PER_SAMPLE - 2)
+                sec_byte = v & 8'hFF;
+            else
+                sec_byte = 8'h00;
         end
     end
 endfunction
@@ -339,11 +367,11 @@ always @(posedge mclk) begin
                     end
                 end
                 if ((ferr_cnt + werr_cnt + serr_cnt) == 0)
-                    $display("PASS stereo=%0d hdr=%0d frames=%0d pops=%0d max_fifo=%0d",
-                             STEREO, hdr_mode, fcnt, rd_cnt, max_occ);
+                    $display("PASS stereo=%0d bps=%0d ext=%0d hdr=%0d frames=%0d pops=%0d max_fifo=%0d",
+                             STEREO, BPS, EXT, hdr_mode, fcnt, rd_cnt, max_occ);
                 else
-                    $display("FAIL stereo=%0d hdr=%0d slope=%0d word=%0d sector=%0d frames=%0d",
-                             STEREO, hdr_mode, ferr_cnt, werr_cnt, serr_cnt, fcnt);
+                    $display("FAIL stereo=%0d bps=%0d ext=%0d hdr=%0d slope=%0d word=%0d sector=%0d frames=%0d",
+                             STEREO, BPS, EXT, hdr_mode, ferr_cnt, werr_cnt, serr_cnt, fcnt);
                 $finish;
             end
         end
@@ -358,7 +386,8 @@ end
 initial begin
     if ($value$plusargs("HDR=%d", hdr_mode)) ;
     build_hdr;
-    $display("hdr_mode=%0d hdr_len=%0d data_size=%0d", hdr_mode, hdr_len, DATA_SIZE);
+    $display("hdr_mode=%0d hdr_len=%0d data_size=%0d bps=%0d ext=%0d stereo=%0d",
+             hdr_mode, hdr_len, DATA_SIZE, BPS, EXT, STEREO);
     rst = 1;
     #200;
     rst = 0;

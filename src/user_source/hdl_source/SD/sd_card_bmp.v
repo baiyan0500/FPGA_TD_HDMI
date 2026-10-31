@@ -17,6 +17,8 @@ module sd_card_bmp #(
     output      [4:0]           img_count,
     output                      sd_ready,
     output                      scan_done_o,
+    output                      o_egv_found,        // 扫描发现 EGV1 容器
+    output [31:0]               o_egv_start_sector, // EGV1 起始扇区（容器头）
 
     // 当前显示图的源尺寸（100MHz 域 BCD：{千,百,十,个}，提交新图后更新）
     // + 更新 toggle（跨域握手，底栏据此标注 "源尺寸>640x480"）
@@ -84,6 +86,11 @@ wire             scan_done;
 wire             scan_found_valid;
 wire [31:0]      scan_found_sector;
 wire [4:0]       scan_found_total;
+wire             egv_found;
+wire [31:0]      egv_start_sector;
+
+assign o_egv_found        = egv_found;
+assign o_egv_start_sector = egv_start_sector;
 
 // ---- WAV 客户端 ----
 wire             wav_found;
@@ -753,6 +760,8 @@ bmp_read bmp_read_m0(
     .scan_found_total       (scan_found_total),
     .wav_found              (wav_found),
     .wav_start_sector       (wav_start_sector),
+    .egv_found              (egv_found),
+    .egv_start_sector       (egv_start_sector),
 
     .load_start             (load_start_pulse),
     .load_abort             (load_abort),

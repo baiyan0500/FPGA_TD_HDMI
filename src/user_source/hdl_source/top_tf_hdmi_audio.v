@@ -135,6 +135,8 @@ wire [15:0] egv_sd_count;
 wire        egv_cli_dv;
 wire [7:0]  egv_cli_data;
 wire        egv_cli_end;
+wire        egv_found_sd;       // 扫描发现 EGV1 容器
+wire [31:0] egv_lba_sd;         // EGV1 起始扇区
 
 wire        egv_pix_en;
 wire [15:0] egv_pix;
@@ -360,6 +362,8 @@ sd_card_bmp #(
     .o_cli_data_valid  (egv_cli_dv),
     .o_cli_data        (egv_cli_data),
     .o_cli_read_end    (egv_cli_end),
+    .o_egv_found       (egv_found_sd),
+    .o_egv_start_sector(egv_lba_sd),
     .o_load_busy       (vid_load_busy)
 );
 
@@ -736,6 +740,9 @@ egv_reader #(
     .i_play           (vid_layer & vid_play_w & vf_ready & sd_ready & ~vid_load_busy),
     .i_fill_ready     (vf_frame_ready),
     .i_sd_ready       (sd_ready),
+    .i_scan_done      (scan_done_sd),
+    .i_egv_found      (egv_found_sd),
+    .i_egv_lba        (egv_lba_sd),
     .o_sd_read        (egv_sd_read),
     .o_sd_addr        (egv_sd_addr),
     .o_sd_count       (egv_sd_count),

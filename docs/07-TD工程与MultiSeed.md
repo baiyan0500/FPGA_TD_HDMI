@@ -113,7 +113,7 @@ cd ../phy_v6/seed_2
 /d/TD/bin/td_commands_prompt.exe /d/TD/doc/scripts/MultiSeed.tcl
 ```
 
-该方案已多次产出 0 违例 bit（2026-10-29 seed 2 为 +557ps / +21ps）；**正式出包仍以官方 GUI Multi-Seed 为准**。
+该方案已多次产出 0 违例 bit（2026-10-31 新 RTL：seed 2 为 -22ps / +21ps / 1 FEP，seed 3 为 **+235ps / +21ps / 0 FEPs**，取 seed 3）；**正式出包仍以官方 GUI Multi-Seed 为准**。注意 TD 对多驱动比 ModelSim 严格：同一寄存器在两个 always 块里复位会直接报 `HDL-8007`，仿真通过不代表综合通过，改完 RTL 先跑一次综合确认 elaborate 无误。
 
 ## 6. 重建检查清单
 

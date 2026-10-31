@@ -12,6 +12,10 @@ module tb_egv_reader;
     reg clk = 0, rst = 1;
     reg play = 0, sd_ready = 0;
     reg fill_ready = 1'b1;          // 填充器背压（bug2：填充未结束不得起新帧）
+    // 本 TB 走编译期段表回退路径（扫描未发现容器）
+    reg        scan_done = 1'b0;
+    reg        egv_found = 1'b0;
+    reg [31:0] egv_lba   = 32'd0;
 
     wire        o_sd_read;
     wire [31:0] o_sd_addr;
@@ -32,6 +36,7 @@ module tb_egv_reader;
     egv_reader #(.FRAME_CYC(23'd210)) dut (
         .clk(clk), .rst(rst), .i_play(play), .i_sd_ready(sd_ready),
         .i_fill_ready(fill_ready),
+        .i_scan_done(scan_done), .i_egv_found(egv_found), .i_egv_lba(egv_lba),
         .o_sd_read(o_sd_read), .o_sd_addr(o_sd_addr), .o_sd_count(o_sd_count),
         .i_sd_data(i_sd_data), .i_sd_data_valid(i_sd_data_valid),
         .i_sd_read_end(i_sd_read_end),
@@ -210,6 +215,7 @@ module tb_egv_reader;
         rst = 0;
         repeat (5) @(posedge clk);
         sd_ready = 1;
+        scan_done = 1;
         play = 1;
 
         // 连续读够长：必须越过 16384 扇区（旧 16bit 段计数器在此会提前"段结束"，
@@ -259,14 +265,14 @@ module tb_egv_reader;
                      k, frames_done, dut.o_active);
             eof_err = eof_err + 1;
         end
-        if (dut.st !== 2'd1) begin                // 应卡在帧间隔等待
+        if (dut.st !== 3'd3) begin                // 应卡在帧间隔等待
             $display("FAIL backpressure: st=%0d (expect S_FWAIT)", dut.st);
             eof_err = eof_err + 1;
         end
         @(negedge clk);
         fill_ready = 1'b1;
         repeat (20) @(posedge clk);
-        if (dut.st !== 2'd2) begin                // 放行后应立即开新帧
+        if (dut.st !== 3'd4) begin                // 放行后应立即开新帧
             $display("FAIL backpressure: no resume (st=%0d)", dut.st);
             eof_err = eof_err + 1;
         end

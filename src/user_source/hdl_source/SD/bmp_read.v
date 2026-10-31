@@ -14,6 +14,8 @@ module bmp_read(
     output reg [4:0]            scan_found_total,
     output reg                  wav_found,          // 扫描发现 WAV 文件
     output reg [31:0]           wav_start_sector,   // WAV 起始扇区
+    output reg                  egv_found,          // 扫描发现 EGV1 视频容器
+    output reg [31:0]           egv_start_sector,   // EGV1 起始扇区（容器头所在扇区）
 
     // 按指定扇区加载一张图到 SDRAM
     input                       load_start,
@@ -80,12 +82,21 @@ reg [7:0]  riff_id0, riff_id1, riff_id2, riff_id3;
 reg [7:0]  wave_id0, wave_id1, wave_id2, wave_id3;
 reg [31:0] riff_size;
 
+// EGV1 容器识别：文件首扇区就是容器头，扫描命中后按 total_bytes 整体跳过，
+// 避免把 200MB 视频按 4KB 步进再扫一遍（EGV1 头布局见 tools/video/mp4_to_egv.py）
+reg        egv_m0, egv_m1, egv_m2, egv_m3;
+reg [31:0] egv_total;
+reg [31:0] egv_skip_q;
+
 wire header_match;
 wire wav_match;
+wire egv_match = egv_m0 && egv_m1 && egv_m2 && egv_m3;
+wire [31:0] egv_skip_w = ({sd_sec_read_data, egv_total[23:0]} + 32'd511) >> 9;
 wire bmp_data_valid;
 wire [31:0] next_scan_sector_if_match;
 wire [31:0] next_scan_sector_if_miss;
 wire [31:0] next_scan_sector_if_wav;
+wire [31:0] next_scan_sector_if_egv;
 
 // 扇区跳转数预计算寄存：头字节锁存拍完成 32bit 加法/移位，扫描状态机
 // 关键路径上只剩"scan_sector + 预计算值"一级加法（否则两级 32bit 运算
@@ -143,6 +154,8 @@ assign next_scan_sector_if_match = scan_sector + file_sector_count_q;
 assign next_scan_sector_if_miss  = (scan_sector + SCAN_STEP) & 32'hFFFF_FFF8;
 // RIFF size = 文件长度 - 8，占 (riff_size + 8 + 511) >> 9 个扇区
 assign next_scan_sector_if_wav   = scan_sector + wav_skip_sectors_q;
+// EGV1 total_bytes 即文件长度，整段跳过（头扇区 + 视频/音频数据）
+assign next_scan_sector_if_egv   = scan_sector + egv_skip_q;
 
 always @(posedge clk or posedge rst) begin
     if (rst) begin
@@ -178,24 +191,31 @@ always @(posedge clk or posedge rst) begin
         riff_size    <= 32'd0;
         file_sector_count_q <= 32'd1;
         wav_skip_sectors_q  <= 32'd1;
+        egv_m0 <= 1'b0; egv_m1 <= 1'b0; egv_m2 <= 1'b0; egv_m3 <= 1'b0;
+        egv_total  <= 32'd0;
+        egv_skip_q <= 32'd8;
     end else if (((state == ST_SCAN) || (state == ST_LOAD_HDR)) && sd_sec_read_data_valid) begin
         case (rd_cnt)
             10'd0 : begin
                 header_0 <= sd_sec_read_data;
                 riff_id0 <= sd_sec_read_data;
+                egv_m0   <= (sd_sec_read_data == "E");
             end
             10'd1 : begin
                 header_1 <= sd_sec_read_data;
                 riff_id1 <= sd_sec_read_data;
+                egv_m1   <= (sd_sec_read_data == "G");
             end
 
             10'd2 : begin
                 file_len[7:0]   <= sd_sec_read_data;
                 riff_id2        <= sd_sec_read_data;
+                egv_m2          <= (sd_sec_read_data == "V");
             end
             10'd3 : begin
                 file_len[15:8]  <= sd_sec_read_data;
                 riff_id3        <= sd_sec_read_data;
+                egv_m3          <= (sd_sec_read_data == "1");
             end
 
             10'd4 : begin
@@ -252,6 +272,16 @@ always @(posedge clk or posedge rst) begin
             10'd31: compression[15:8] <= sd_sec_read_data;
             10'd32: compression[23:16] <= sd_sec_read_data;
             10'd33: compression[31:24] <= sd_sec_read_data;
+
+            10'd36: egv_total[7:0]   <= sd_sec_read_data;
+            10'd37: egv_total[15:8]  <= sd_sec_read_data;
+            10'd38: egv_total[23:16] <= sd_sec_read_data;
+            10'd39: begin
+                egv_total[31:24] <= sd_sec_read_data;
+                // 文件长度 = total_bytes，按扇区数跳到容器尾部；至少前进 8 扇区
+                // （total_bytes=0 的畸形头若原地跳转会锁死扫描）
+                egv_skip_q <= (egv_skip_w < 32'd8) ? 32'd8 : egv_skip_w;
+            end
             default: ;
         endcase
     end
@@ -345,6 +375,8 @@ always @(posedge clk or posedge rst) begin
         scan_found_total  <= 5'd0;
         wav_found         <= 1'b0;
         wav_start_sector  <= 32'd0;
+        egv_found         <= 1'b0;
+        egv_start_sector  <= 32'd0;
         scan_sector       <= 32'd0;
         load_sector_latched <= 32'd0;
     end else if (!sd_init_done) begin
@@ -359,6 +391,8 @@ always @(posedge clk or posedge rst) begin
         scan_found_total  <= 5'd0;
         wav_found         <= 1'b0;
         wav_start_sector  <= 32'd0;
+        egv_found         <= 1'b0;
+        egv_start_sector  <= 32'd0;
         scan_sector       <= 32'd0;
         load_sector_latched <= 32'd0;
     end else if (load_abort) begin
@@ -422,6 +456,19 @@ always @(posedge clk or posedge rst) begin
                         end
                         sd_sec_read_addr <= next_scan_sector_if_wav;
                         scan_sector      <= next_scan_sector_if_wav;
+                    end else if (egv_match && !egv_found) begin
+                        // EGV1 视频容器：首扇区即容器头，记录起始扇区后整段跳过。
+                        // 容器可到 200MB，4KB 步进扫穿要十几秒，必须按长度跳。
+                        egv_found        <= 1'b1;
+                        egv_start_sector <= scan_sector;
+
+                        if (next_scan_sector_if_egv > scan_max_sector) begin
+                            scan_done <= 1'b1;
+                            state     <= ST_IDLE;
+                        end else begin
+                            sd_sec_read_addr <= next_scan_sector_if_egv;
+                            scan_sector      <= next_scan_sector_if_egv;
+                        end
                     end else begin
                         // 未命中：4KB 对齐步进，扫到 scan_max_sector 为止
                         if (scan_sector >= scan_max_sector) begin

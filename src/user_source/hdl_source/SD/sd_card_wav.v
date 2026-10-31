@@ -7,14 +7,16 @@
 //   2. 校验通过后按 FIFO 水位持续从 SD 读取 PCM 写入跨时钟 FIFO
 //      （100MHz 写 / 12.288MHz 读），供 wav_i2s_source 做 ASRC + I2S 输出；
 //   3. 播放到 data 尾部自动循环；暂停（K1）时不读 SD，恢复后从断点继续；
-//   4. 解析失败（非 PCM/非 16bit/采样率不支持/无 data）→ o_active 永久为 0，
+//   4. 解析失败（非 PCM/采样率不支持/无 data）→ o_active 永久为 0，
 //      音频回退系统测试音。
 //
 // SD 总线共享：与 bmp_read 共用 sd_card_top（sd_card_bmp 内仲裁）。
 //   i_bus_grant=1 期间本模块独占总线；仲裁器保证 grant 撤销时本模块无在途扇区
 //   （释放条件包含在途扇区完成）。
 //
-// 支持：16bit PCM，mono/stereo，8k/11.025k/16k/22.05k/24k/32k/44.1k/48k
+// 支持：16/24/32bit PCM，WAVE_FORMAT_PCM(1) 与 WAVE_FORMAT_EXTENSIBLE(0xFFFE，
+//       子格式 PCM)，mono/stereo，8k/11.025k/16k/22.05k/24k/32k/44.1k/48k。
+//       24/32bit 取每个样本的高 16bit（LE 下即最后两个字节，无需移位寄存器）。
 // ============================================================================
 module sd_card_wav #(
     parameter integer CLK_FREQ_HZ = 100_000_000
@@ -76,6 +78,7 @@ reg [7:0]  id_sr;            // 'WAVE' 校验移位
 reg        wave_ok;
 reg        fmt_seen;
 reg [15:0] fmt_format;
+reg [15:0] fmt_sub;          // EXTENSIBLE 子格式 tag（1 = PCM）
 reg [15:0] fmt_ch;
 reg [15:0] fmt_bps;
 reg        data_seen;
@@ -86,8 +89,9 @@ reg [31:0] fmt_rate;         // 采样率（解析器独立装配）
 // ---- 播放寄存器 ----
 reg [8:0]  sec_byte_cnt;     // 扇区内字节 0..511
 reg [31:0] byte_pos;         // data 有效字节计数（跨扇区累计）
-reg        byte_ph;          // 16bit 组装相位 0=lo 1=hi
-reg [7:0]  lo_byte;
+reg [1:0]  lane;             // 样本内字节序号 0..bytes_per_sample-1
+reg [1:0]  last_lane_r;      // bytes_per_sample-1（W_ARM 时按 fmt_bps 锁存）
+reg [7:0]  prev_byte;        // 前一字节（高 16bit 取 {当前, 前一}）
 
 // ---------------------------------------------------------------------------
 // rate → ASRC step 查表（33bit 定点，0 = 不支持）
@@ -133,10 +137,17 @@ function [32:0] idx2step;
 endfunction
 
 wire [32:0] rate_step_val = idx2step(rate_idx);
-wire        fmt_ok = fmt_seen && data_seen && wave_ok &&
-                    (fmt_format == 16'd1) && (fmt_bps == 16'd16) &&
+// WAVE_FORMAT_PCM 或 WAVE_FORMAT_EXTENSIBLE+子格式 PCM（python/1.wav 即后者）
+wire        fmt_pcm  = (fmt_format == 16'd1) ||
+                       ((fmt_format == 16'hFFFE) && (fmt_sub == 16'd1));
+wire        fmt_bps_ok = (fmt_bps == 16'd16) || (fmt_bps == 16'd24) ||
+                         (fmt_bps == 16'd32);
+wire        fmt_ok = fmt_seen && data_seen && wave_ok && fmt_pcm && fmt_bps_ok &&
                     ((fmt_ch == 16'd1) || (fmt_ch == 16'd2)) &&
                     (rate_idx != 4'd8) && (data_size != 32'd0);
+// 每个样本字节数 - 1：16bit→1，24bit→2，32bit→3
+wire [1:0]  lane_last_w = (fmt_bps == 16'd32) ? 2'd3 :
+                          (fmt_bps == 16'd24) ? 2'd2 : 2'd1;
 
 // fmt_ok 打一拍：头解析结束后参数已稳定，W_ARM 用寄存值决策，
 // 避免 32bit data_size 比较器串入 state/cur_sector 使能（SWNS -0.028ns）
@@ -209,7 +220,7 @@ always @(posedge clk or posedge rst) begin
         chunk_size <= 32'd0; chunk_cofs <= 32'd0;
         id0 <= 8'd0; id1 <= 8'd0; id2 <= 8'd0; id3 <= 8'd0;
         id_sr <= 8'd0; wave_ok <= 1'b0; fmt_seen <= 1'b0;
-        fmt_format <= 16'd0; fmt_ch <= 16'd0; fmt_bps <= 16'd0;
+        fmt_format <= 16'd0; fmt_sub <= 16'd0; fmt_ch <= 16'd0; fmt_bps <= 16'd0;
         data_seen <= 1'b0; data_off <= 32'd0; data_size <= 32'd0;
         id_cnt <= 2'd0; sz_cnt <= 2'd0;
     end else if (parse_en) begin
@@ -254,7 +265,7 @@ always @(posedge clk or posedge rst) begin
             end
 
             P_PAYLOAD: begin
-                if (!fmt_seen && ({id3, id2, id1, id0} == "fmt ")) begin
+                if ({id3, id2, id1, id0} == "fmt ") begin
                     case (chunk_cofs)
                         32'd0:  fmt_format <= {fmt_format[15:8], pdata};
                         32'd1:  fmt_format <= {pdata, fmt_format[7:0]};
@@ -265,6 +276,9 @@ always @(posedge clk or posedge rst) begin
                             fmt_bps  <= {pdata, fmt_bps[7:0]};
                             fmt_seen <= 1'b1;
                         end
+                        // EXTENSIBLE 的 SubFormat GUID 前 2 字节 = 子格式 tag
+                        32'd24: fmt_sub <= {fmt_sub[15:8], pdata};
+                        32'd25: fmt_sub <= {pdata, fmt_sub[7:0]};
                         default: ;
                     endcase
                 end
@@ -306,7 +320,8 @@ always @(posedge clk or posedge rst) begin
         o_stereo    <= 1'b0;
         sec_byte_cnt<= 9'd0;
         byte_pos    <= 32'd0;
-        byte_ph     <= 1'b0;
+        lane        <= 2'd0;
+        last_lane_r <= 2'd1;
         in_data_zone<= 1'b0;
     end else begin
         case (state)
@@ -342,6 +357,7 @@ always @(posedge clk or posedge rst) begin
                     // 先锁参数（提前于 active ≥15 拍，保证跨域采样稳定）
                     o_rate_step       <= rate_step_val;
                     o_stereo          <= (fmt_ch == 16'd2);
+                    last_lane_r       <= lane_last_w;
                     data_start_sector <= i_wav_start_sector + (data_off >> 9);
                 end else if (arm_cnt == 4'd15) begin
                     if (fmt_ok_r) begin
@@ -349,7 +365,7 @@ always @(posedge clk or posedge rst) begin
                         byte_pos     <= 32'd0;
                         in_data_zone <= 1'b1;    // data_size != 0（fmt_ok 已保证）
                         sec_byte_cnt <= 9'd0;
-                        byte_ph      <= 1'b0;
+                        lane         <= 2'd0;
                         state        <= W_PLAY;
                         o_active     <= 1'b1;
                     end else begin
@@ -375,7 +391,7 @@ always @(posedge clk or posedge rst) begin
                         sd_sec_addr  <= data_start_sector;
                         byte_pos     <= 32'd0;
                         in_data_zone <= 1'b1;
-                        byte_ph      <= 1'b0;
+                        lane         <= 2'd0;
                     end else begin
                         cur_sector   <= cur_sector + 32'd1;
                         sd_sec_addr  <= cur_sector + 32'd1;
@@ -385,7 +401,7 @@ always @(posedge clk or posedge rst) begin
                     if (byte_valid) begin
                         byte_pos     <= byte_pos + 32'd1;
                         in_data_zone <= ((byte_pos + 32'd1) < data_size);
-                        byte_ph      <= ~byte_ph;
+                        lane         <= (lane == last_lane_r) ? 2'd0 : lane + 2'd1;
                     end
                 end
             end
@@ -401,21 +417,24 @@ always @(posedge clk or posedge rst) begin
 end
 
 // ---------------------------------------------------------------------------
-// 16bit 小端组装 + FIFO 写（hi 字节拍完成一个样本字）
+// 样本组装 + FIFO 写（每个样本末字节拍写入，取高 16bit）
+//   16bit：{b1,b0}；24bit：{b2,b1}；32bit：{b3,b2}
+//   LE 下高 16bit 恒为 {当前字节, 前一字节}，所以只需 lane + prev_byte，
+//   与位深无关（不需要移位寄存器/可变长度桶形移位）。
 // 写通道打一拍：byte_valid 含 32bit 扇区比较长组合链，直接驱动 2048 深 RAM
 // 写使能译码会超 100MHz 时序（SWNS -5.015ns），故先寄存 we/wd 再写 RAM
 // ---------------------------------------------------------------------------
-wire       fifo_we_raw = byte_valid && byte_ph;
-wire [15:0] fifo_wd_raw = {sd_sec_data, lo_byte};
+wire       fifo_we_raw = byte_valid && (lane == last_lane_r);
+wire [15:0] fifo_wd_raw = {sd_sec_data, prev_byte};
 
 reg        fifo_we;
 reg [15:0] fifo_wd;
 
 always @(posedge clk or posedge rst) begin
     if (rst)
-        lo_byte <= 8'd0;
-    else if (byte_valid && !byte_ph)
-        lo_byte <= sd_sec_data;
+        prev_byte <= 8'd0;
+    else if (byte_valid)
+        prev_byte <= sd_sec_data;
 end
 
 always @(posedge clk or posedge rst) begin
