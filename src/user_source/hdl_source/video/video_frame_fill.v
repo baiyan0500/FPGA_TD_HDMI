@@ -10,8 +10,14 @@
 // 行缓冲：4 个 512x16 BRAM（仅用 320 深度）。源行 r 写 bank r[1:0]，
 //         输出端读同一 bank；4 bank 保证写端不会覆盖正在读的行。
 //
-// 时序：写口 4 拍一字（25M 字/s = 100MB/s），远低于 SDRAM 上限；
-//       一帧 296 行约 11.4ms，远小于 41.7ms 帧周期。
+// 时序：写口严格 4 拍一字（25M 字/s = 100MB/s）。
+//       每个输出像素走 E_RD→E_W0→E_W1 三态，每态等一个 step（4 拍），
+//       即 12 拍出 2 字 = 6 拍/字，一帧 296 行约 11.4ms，远小于 41.7ms。
+//
+// 【重要】历史上 E_ROWW/E_RD/E_W0/E_W1 没有受 step 门控，实际是 2 拍出 2 字
+//   （≈67M 字/s，400MB/s），叠加显示读口 25M 字/s 后 SDRAM 带宽过载，
+//   写 FIFO 溢出丢字 → 每行内容前移，表现为画面横向循环错位 + 彩色条纹。
+//   这里必须用 step 门控，不能裸推进状态机。
 // ============================================================================
 `timescale 1ns/1ps
 
@@ -44,7 +50,9 @@ module video_frame_fill #(
     output reg         o_ready,       // 初始化完成，可以显示视频
     output wire        o_frame_ready, // 空闲，可接收新的帧起始（防止丢帧）
     output wire        o_busy,
-    output reg         o_frame_end
+    output reg         o_frame_end,
+    output reg         o_frame_ok,    // 最近一帧源像素数 == SRC_W*SRC_H（OSD 自证位）
+    output reg  [15:0] o_pix_cnt      // 最近一帧实际收到的源像素数（诊断）
 );
 
     // ------------------------------------------------------------------
@@ -61,6 +69,7 @@ module video_frame_fill #(
     wire [1:0] e_bank = e_row[1:0];
 
     wire [15:0] lb0_dob, lb1_dob, lb2_dob, lb3_dob;
+
     reg  [15:0] lb_dout;
 
     always @(*) begin
@@ -165,6 +174,36 @@ module video_frame_fill #(
     reg        init_phase;
     reg [20:0] zcnt;
 
+    // ------------------------------------------------------------------
+    // 帧完整性 / 停滞保护
+    //   · pix_cnt：本帧实际收到的源像素数，E_END 时与 320*148 比较，
+    //     结果送 OSD 的 OK/NG 自证位（OK=SD 数据完整，NG=少/多字节）。
+    //   · pad：本帧源数据没送到（或整帧停滞）时，把剩余行补零写满
+    //     VIDEO_WORDS。没有这条，一行数据迟迟不来时 E_ROWW 会永远等
+    //     下去，而 reader 在 S_FWAIT 等 o_frame_ready —— 双向死锁，
+    //     表现为"按 K1 只闪一下、FRAM 不再递增"。
+    //   · 看门狗按"整行无进展"计时（每完成一行清零），90ms 阈值远大于
+    //     正常一行 205us，又远小于人手能察觉的卡死时间。
+    // ------------------------------------------------------------------
+    localparam [15:0] SRC_PIX = SRC_W * SRC_H;
+    reg  [15:0] pix_cnt;
+    reg         pad;
+    reg  [7:0]  wd_div;
+    reg  [14:0] wd_cnt;
+    wire        wd_tick = (wd_div == 8'hFF);
+    localparam [14:0] WD_MAX = 15'd35156;          // 90ms @100MHz（256 分频）
+
+    // 分频器单独一个 always；wd_cnt 只在主状态机块里驱动（单一驱动源）
+    always @(posedge clk or posedge rst) begin
+        if (rst)
+            wd_div <= 8'd0;
+        else
+            wd_div <= wd_tick ? 8'd0 : (wd_div + 8'd1);
+    end
+
+    // 补零帧的像素源
+    wire [23:0] pix_out = pad ? 24'd0 : pix888;
+
     assign o_busy = (st != E_OFF) && (st != E_IDLE);
     // 只有 E_IDLE 会接受 i_frame_start，因此读端必须等这个电平再发起下一帧，
     // 否则上一帧尾行的 296 行写口还没收完，新帧的起始脉冲会被丢掉（隔帧丢图）
@@ -184,6 +223,10 @@ module video_frame_fill #(
             o_frame_end <= 1'b0;
             init_phase  <= 1'b0;
             zcnt        <= 21'd0;
+            pix_cnt     <= 16'd0;
+            pad         <= 1'b0;
+            o_frame_ok  <= 1'b0;
+            o_pix_cnt   <= 16'd0;
             f_row       <= 9'd0;
             f_col       <= 9'd0;
             e_row       <= 9'd0;
@@ -193,13 +236,22 @@ module video_frame_fill #(
             o_wr_en     <= 1'b0;
             o_frame_end <= 1'b0;
 
-            // ---- 行缓冲填充 ----
-            if (i_pix_en && (f_row < SRC_H)) begin
-                if (f_col == SRC_W[8:0] - 9'd1) begin
-                    f_col <= 9'd0;
-                    f_row <= f_row + 9'd1;
-                end else
-                    f_col <= f_col + 9'd1;
+            // 停滞看门狗（整行无进展计时；下面的状态机分支优先清零）
+            if (wd_tick && (wd_cnt != WD_MAX) &&
+                (st != E_OFF) && (st != E_IDLE))
+                wd_cnt <= wd_cnt + 15'd1;
+
+            // ---- 行缓冲填充 + 帧内像素计数 ----
+            if (i_pix_en) begin
+                if (pix_cnt != SRC_PIX)
+                    pix_cnt <= pix_cnt + 16'd1;
+                if (f_row < SRC_H) begin
+                    if (f_col == SRC_W[8:0] - 9'd1) begin
+                        f_col <= 9'd0;
+                        f_row <= f_row + 9'd1;
+                    end else
+                        f_col <= f_col + 9'd1;
+                end
             end
 
             // ---- 显示缓冲切换（帧真正写进 SDRAM 后）----
@@ -264,6 +316,9 @@ module video_frame_fill #(
                     e_row <= 9'd0;
                     p     <= 9'd0;
                     phase <= 1'b0;
+                    pix_cnt <= 16'd0;
+                    pad     <= 1'b0;
+                    wd_cnt  <= 15'd0;
                     o_wr_bank   <= ~o_disp_bank;
                     o_wr_len    <= VIDEO_WORDS;
                     o_addr_full <= 1'b0;
@@ -274,43 +329,68 @@ module video_frame_fill #(
             E_ACK: begin
                 if (i_wr_ack) begin
                     o_wr_req <= 1'b0;
+                    wd_cnt   <= 15'd0;
                     st       <= E_ROWW;
+                end else if (wd_cnt >= WD_MAX) begin
+                    // 写口一直不应答（SDRAM 未初始化等）：放弃本帧，回到空闲，
+                    // 保持上一帧画面，下一帧再试
+                    o_wr_req <= 1'b0;
+                    st       <= E_IDLE;
                 end
             end
             E_ROWW: begin
-                if (f_row > e_row)
-                    st <= E_RD;
+                // 等下一源行填满（填一行约 205us、输出一行约 77us）。
+                // 若整行 90ms 无进展（reader 已停、SD 卡死等），转 E_PAD 补零
+                // 收尾，绝不能无限等 —— reader 在 S_FWAIT 等 o_frame_ready。
+                if (pad || (step && (f_row > e_row))) begin
+                    wd_cnt <= 15'd0;
+                    st     <= E_RD;
+                end else if (wd_cnt >= WD_MAX) begin
+                    pad   <= 1'b1;
+                    p     <= 9'd0;
+                    phase <= 1'b0;
+                    st    <= E_RD;
+                end
             end
             E_RD: begin
-                st <= E_W0;
+                if (step)
+                    st <= E_W0;
             end
             E_W0: begin
-                o_wr_en   <= 1'b1;
-                o_wr_data <= {pix888, 8'h00};
-                st        <= E_W1;
+                if (step) begin
+                    o_wr_en   <= 1'b1;
+                    o_wr_data <= {pix_out, 8'h00};
+                    st        <= E_W1;
+                end
             end
             E_W1: begin
-                o_wr_en   <= 1'b1;
-                o_wr_data <= {pix888, 8'h00};
-                if (p == SRC_W[8:0] - 9'd1) begin
-                    p <= 9'd0;
-                    if (!phase) begin
-                        phase <= 1'b1;
-                        st    <= E_RD;
+                if (step) begin
+                    o_wr_en   <= 1'b1;
+                    o_wr_data <= {pix_out, 8'h00};
+                    if (p == SRC_W[8:0] - 9'd1) begin
+                        p <= 9'd0;
+                        if (!phase) begin
+                            phase <= 1'b1;
+                            st    <= E_RD;
+                        end else begin
+                            phase <= 1'b0;
+                            e_row <= e_row + 9'd1;
+                            if (e_row == SRC_H[8:0] - 9'd1)
+                                st <= E_END;
+                            else
+                                st <= E_ROWW;
+                        end
                     end else begin
-                        phase <= 1'b0;
-                        e_row <= e_row + 9'd1;
-                        if (e_row == SRC_H[8:0] - 9'd1)
-                            st <= E_END;
-                        else
-                            st <= E_ROWW;
+                        p  <= p + 9'd1;
+                        st <= E_RD;
                     end
-                end else begin
-                    p  <= p + 9'd1;
-                    st <= E_RD;
                 end
             end
             E_END: begin
+                // 坏帧照样上屏（否则 SD 持续丢字节时永久黑屏），但记录自证位：
+                // OK = 本帧恰好收到 320*148 个源像素，NG = 少/多字节，SD 物理层有问题
+                o_frame_ok <= (pix_cnt == SRC_PIX);
+                o_pix_cnt  <= pix_cnt;
                 st <= E_IDLE;
             end
             default: st <= E_OFF;

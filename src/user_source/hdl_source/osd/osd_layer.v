@@ -6,6 +6,8 @@
 // 启动阶段（首图提交前）：左面板标题/跑马灯/进度，右面板按键功能说明。
 //
 // 全层共用一套 font8x8 字库（优先级选择字符），避免 4 份 ROM 复制。
+// SW4 告警层（i_warn_en）优先级最高：全屏压暗染红 + 上下 45° 警示斜纹带
+// + 居中告警卡片（4 倍字号 WARNING + 4 行 2 倍字号说明），整体呼吸脉动。
 // ============================================================================
 module osd_layer #(
     parameter H_ACTIVE = 640,
@@ -24,6 +26,7 @@ module osd_layer #(
     input  wire [1:0]  i_mode,     // 转场模式 0~3
     input  wire [2:0]  i_bright,   // 亮度档 0~4（显示为 20%~100%）
     input  wire [2:0]  i_contrast, // 对比度档 0~4
+    input  wire [3:0]  i_sw,       // 拨码实测电平（已同步到 video_clk），菜单右侧显示
     input  wire [255:0] i_slogan,
     input  wire [5:0]  i_slogan_len,
     input  wire        i_slogan_dir,
@@ -44,16 +47,19 @@ module osd_layer #(
 
     input  wire        i_rm_en,      // 层3：资源面板
     input  wire        i_video_on,
+    input  wire        i_vok,        // 视频帧完整性自证位（1=最近一帧源像素恰好 320*148）
     input  wire        i_vid_ftgl,   // 每出一帧视频翻转一次（100MHz 域）
 
     input  wire        i_display_valid,   // 首图已提交（隐藏启动面板）
     input  wire        i_sd_init_done,
     input  wire        i_scan_done,
     input  wire [4:0]  i_img_count,
+    input  wire        i_wav_found,   // 扫描发现 WAV（启动面板 AUDIO 行）
     input  wire [15:0] i_src_w_bcd,
     input  wire [15:0] i_src_h_bcd,
     input  wire        i_src_tgl,
     input  wire        i_auto_play,
+    input  wire        i_warn_en,     // SW4：最高优先级告警层
 
     output reg         o_hs,
     output reg         o_vs,
@@ -655,80 +661,75 @@ module osd_layer #(
         end
     endfunction
 
-    // 右面板按键说明（9 行 × 最多 23 字符）
+    // 右面板按键说明（9 行 × 最多 23 字符，1x 字号）
+    // 文字与 ctrl.v 的按键映射严格对应（改按键必须先改这里）：
+    //   SW1 = i_sw[0]：K1 转场模式 / K2 切换到下一张 / K3 亮度 / K4 对比度
+    //   SW2 = i_sw[1]：K1 转场模式 / K2 自动播放 / K3 音频开关 / K4 可视化模式
+    //   SW3 = i_sw[2]：K1 视频播放 / K2 弹幕 / K3 频谱 / K4 资源面板
+    // 拨码行右端 ON / -- 为该拨码的实测电平（i_sw 已经在 video_clk 下两级同步）。
     function [6:0] guide_char;
         input [3:0] line;
         input [4:0] col;
         begin
             guide_char = 7'h20;
             case (line)
-                4'd0: begin   // SW1 IMAGE LAYER
+                4'd0: begin   // SW1 IMAGE LAYER        + 拨码实测电平
                     case (col)
-                        5'd0: guide_char = "S";
-                        5'd1: guide_char = "W";
-                        5'd2: guide_char = "1";
-                        5'd3: guide_char = " ";
-                        5'd4: guide_char = "I";
-                        5'd5: guide_char = "M";
-                        5'd6: guide_char = "A";
-                        5'd7: guide_char = "G";
-                        5'd8: guide_char = "E";
-                        5'd9: guide_char = " ";
+                        5'd0:  guide_char = "S";
+                        5'd1:  guide_char = "W";
+                        5'd2:  guide_char = "1";
+                        5'd4:  guide_char = "I";
+                        5'd5:  guide_char = "M";
+                        5'd6:  guide_char = "A";
+                        5'd7:  guide_char = "G";
+                        5'd8:  guide_char = "E";
                         5'd10: guide_char = "L";
                         5'd11: guide_char = "A";
                         5'd12: guide_char = "Y";
                         5'd13: guide_char = "E";
                         5'd14: guide_char = "R";
+                        5'd16: guide_char = i_sw[0] ? "O" : "-";
+                        5'd17: guide_char = i_sw[0] ? "N" : "-";
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd1: begin   //  K1 MODE  K2 NEXT
+                4'd1: begin   //  K1 MODE   K2 NEXT
                     case (col)
-                        5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
                         5'd2:  guide_char = "1";
-                        5'd3:  guide_char = " ";
                         5'd4:  guide_char = "M";
                         5'd5:  guide_char = "O";
                         5'd6:  guide_char = "D";
                         5'd7:  guide_char = "E";
-                        5'd8:  guide_char = " ";
-                        5'd9:  guide_char = " ";
-                        5'd10: guide_char = "K";
-                        5'd11: guide_char = "2";
-                        5'd12: guide_char = " ";
-                        5'd13: guide_char = "N";
-                        5'd14: guide_char = "E";
-                        5'd15: guide_char = "X";
-                        5'd16: guide_char = "T";
+                        5'd11: guide_char = "K";
+                        5'd12: guide_char = "2";
+                        5'd14: guide_char = "N";
+                        5'd15: guide_char = "E";
+                        5'd16: guide_char = "X";
+                        5'd17: guide_char = "T";
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd2: begin   //  K3 CONTRAST K4 BRIGHT
+                4'd2: begin   //  K3 BRIGHT K4 CONTRAST
                     case (col)
-                        5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
                         5'd2:  guide_char = "3";
-                        5'd3:  guide_char = " ";
-                        5'd4:  guide_char = "C";
-                        5'd5:  guide_char = "O";
-                        5'd6:  guide_char = "N";
-                        5'd7:  guide_char = "T";
-                        5'd8:  guide_char = "R";
-                        5'd9:  guide_char = "A";
-                        5'd10: guide_char = "S";
-                        5'd11: guide_char = "T";
-                        5'd12: guide_char = " ";
-                        5'd13: guide_char = " ";
-                        5'd14: guide_char = "K";
-                        5'd15: guide_char = "4";
-                        5'd16: guide_char = " ";
-                        5'd17: guide_char = "B";
+                        5'd4:  guide_char = "B";
+                        5'd5:  guide_char = "R";
+                        5'd6:  guide_char = "I";
+                        5'd7:  guide_char = "G";
+                        5'd8:  guide_char = "H";
+                        5'd9:  guide_char = "T";
+                        5'd11: guide_char = "K";
+                        5'd12: guide_char = "4";
+                        5'd14: guide_char = "C";
+                        5'd15: guide_char = "O";
+                        5'd16: guide_char = "N";
+                        5'd17: guide_char = "T";
                         5'd18: guide_char = "R";
-                        5'd19: guide_char = "I";
-                        5'd20: guide_char = "G";
-                        5'd21: guide_char = "H";
-                        5'd22: guide_char = "T";
+                        5'd19: guide_char = "A";
+                        5'd20: guide_char = "S";
+                        5'd21: guide_char = "T";
                         default: guide_char = 7'h20;
                     endcase
                 end
@@ -737,62 +738,52 @@ module osd_layer #(
                         5'd0:  guide_char = "S";
                         5'd1:  guide_char = "W";
                         5'd2:  guide_char = "2";
-                        5'd3:  guide_char = " ";
                         5'd4:  guide_char = "A";
                         5'd5:  guide_char = "U";
                         5'd6:  guide_char = "T";
                         5'd7:  guide_char = "O";
-                        5'd8:  guide_char = " ";
                         5'd9:  guide_char = "L";
                         5'd10: guide_char = "A";
                         5'd11: guide_char = "Y";
                         5'd12: guide_char = "E";
                         5'd13: guide_char = "R";
+                        5'd16: guide_char = i_sw[1] ? "O" : "-";
+                        5'd17: guide_char = i_sw[1] ? "N" : "-";
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd4: begin   //  K1 MODE  K2 AUTOPLAY
+                4'd4: begin   //  K1 MODE   K2 AUTOPLAY
                     case (col)
-                        5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
                         5'd2:  guide_char = "1";
-                        5'd3:  guide_char = " ";
                         5'd4:  guide_char = "M";
                         5'd5:  guide_char = "O";
                         5'd6:  guide_char = "D";
                         5'd7:  guide_char = "E";
-                        5'd8:  guide_char = " ";
-                        5'd9:  guide_char = " ";
-                        5'd10: guide_char = "K";
-                        5'd11: guide_char = "2";
-                        5'd12: guide_char = " ";
-                        5'd13: guide_char = "A";
-                        5'd14: guide_char = "U";
-                        5'd15: guide_char = "T";
-                        5'd16: guide_char = "O";
-                        5'd17: guide_char = "P";
-                        5'd18: guide_char = "L";
-                        5'd19: guide_char = "A";
-                        5'd20: guide_char = "Y";
+                        5'd11: guide_char = "K";
+                        5'd12: guide_char = "2";
+                        5'd14: guide_char = "A";
+                        5'd15: guide_char = "U";
+                        5'd16: guide_char = "T";
+                        5'd17: guide_char = "O";
+                        5'd18: guide_char = "P";
+                        5'd19: guide_char = "L";
+                        5'd20: guide_char = "A";
+                        5'd21: guide_char = "Y";
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd5: begin   //  K3 AUDIO K4 VIZ
+                4'd5: begin   //  K3 AUDIO  K4 VIZ
                     case (col)
-                        5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
                         5'd2:  guide_char = "3";
-                        5'd3:  guide_char = " ";
                         5'd4:  guide_char = "A";
                         5'd5:  guide_char = "U";
                         5'd6:  guide_char = "D";
                         5'd7:  guide_char = "I";
                         5'd8:  guide_char = "O";
-                        5'd9:  guide_char = " ";
-                        5'd10: guide_char = " ";
                         5'd11: guide_char = "K";
                         5'd12: guide_char = "4";
-                        5'd13: guide_char = " ";
                         5'd14: guide_char = "V";
                         5'd15: guide_char = "I";
                         5'd16: guide_char = "Z";
@@ -804,67 +795,57 @@ module osd_layer #(
                         5'd0:  guide_char = "S";
                         5'd1:  guide_char = "W";
                         5'd2:  guide_char = "3";
-                        5'd3:  guide_char = " ";
                         5'd4:  guide_char = "V";
                         5'd5:  guide_char = "I";
                         5'd6:  guide_char = "D";
                         5'd7:  guide_char = "E";
                         5'd8:  guide_char = "O";
-                        5'd9:  guide_char = " ";
                         5'd10: guide_char = "L";
                         5'd11: guide_char = "A";
                         5'd12: guide_char = "Y";
                         5'd13: guide_char = "E";
                         5'd14: guide_char = "R";
+                        5'd16: guide_char = i_sw[2] ? "O" : "-";
+                        5'd17: guide_char = i_sw[2] ? "N" : "-";
                         default: guide_char = 7'h20;
                     endcase
                 end
-                4'd7: begin   //  K1 PLAY K2 DANMAKU
+                4'd7: begin   //  K1 PLAY   K2 DANMAKU
                     case (col)
-                        5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
                         5'd2:  guide_char = "1";
-                        5'd3:  guide_char = " ";
                         5'd4:  guide_char = "P";
                         5'd5:  guide_char = "L";
                         5'd6:  guide_char = "A";
                         5'd7:  guide_char = "Y";
-                        5'd8:  guide_char = " ";
-                        5'd9:  guide_char = " ";
-                        5'd10: guide_char = "K";
-                        5'd11: guide_char = "2";
-                        5'd12: guide_char = " ";
-                        5'd13: guide_char = "D";
-                        5'd14: guide_char = "A";
-                        5'd15: guide_char = "N";
-                        5'd16: guide_char = "M";
-                        5'd17: guide_char = "A";
-                        5'd18: guide_char = "K";
-                        5'd19: guide_char = "U";
+                        5'd11: guide_char = "K";
+                        5'd12: guide_char = "2";
+                        5'd14: guide_char = "D";
+                        5'd15: guide_char = "A";
+                        5'd16: guide_char = "N";
+                        5'd17: guide_char = "M";
+                        5'd18: guide_char = "A";
+                        5'd19: guide_char = "K";
+                        5'd20: guide_char = "U";
                         default: guide_char = 7'h20;
                     endcase
                 end
-                default: begin // K3 SPEC K4 RESMON
+                default: begin //  K3 SPEC   K4 RESMON  
                     case (col)
-                        5'd0:  guide_char = " ";
                         5'd1:  guide_char = "K";
                         5'd2:  guide_char = "3";
-                        5'd3:  guide_char = " ";
                         5'd4:  guide_char = "S";
                         5'd5:  guide_char = "P";
                         5'd6:  guide_char = "E";
                         5'd7:  guide_char = "C";
-                        5'd8:  guide_char = " ";
-                        5'd9:  guide_char = " ";
-                        5'd10: guide_char = "K";
-                        5'd11: guide_char = "4";
-                        5'd12: guide_char = " ";
-                        5'd13: guide_char = "R";
-                        5'd14: guide_char = "E";
-                        5'd15: guide_char = "S";
-                        5'd16: guide_char = "M";
-                        5'd17: guide_char = "O";
-                        5'd18: guide_char = "N";
+                        5'd11: guide_char = "K";
+                        5'd12: guide_char = "4";
+                        5'd14: guide_char = "R";
+                        5'd15: guide_char = "E";
+                        5'd16: guide_char = "S";
+                        5'd17: guide_char = "M";
+                        5'd18: guide_char = "O";
+                        5'd19: guide_char = "N";
                         default: guide_char = 7'h20;
                     endcase
                 end
@@ -872,7 +853,10 @@ module osd_layer #(
         end
     endfunction
 
-    // 右面板实时状态（3 行 × 16 字符，B/C 以百分比显示）
+    // 拨码 → 当前生效层（与 ctrl.v 的优先级一致：SW1 > SW2 > SW3）
+    wire [1:0] sw_layer = i_sw[0] ? 2'd1 : i_sw[1] ? 2'd2 : i_sw[2] ? 2'd3 : 2'd0;
+
+    // 右面板实时状态（4 行 × 16 字符，B/C 以百分比显示）
     function [6:0] stat_char;
         input [1:0] line;
         input [4:0] col;
@@ -918,7 +902,7 @@ module osd_layer #(
                         default: stat_char = 7'h20;
                     endcase
                 end
-                default: begin // DM:OFF VD:STOP
+                2'd2: begin   // DM:OFF VD:STOP
                     case (col)
                         5'd0:  stat_char = "D";
                         5'd1:  stat_char = "M";
@@ -933,6 +917,23 @@ module osd_layer #(
                         5'd10: stat_char = i_video_on ? "U" : "T";
                         5'd11: stat_char = i_video_on ? "N" : "O";
                         5'd12: stat_char = i_video_on ? " " : "P";
+                        default: stat_char = 7'h20;
+                    endcase
+                end
+                default: begin // SW:1000 LT:3   拨码实测 + 当前生效层
+                    case (col)
+                        5'd0:  stat_char = "S";
+                        5'd1:  stat_char = "W";
+                        5'd2:  stat_char = ":";
+                        5'd3:  stat_char = {3'h3, 3'b000, i_sw[3]};
+                        5'd4:  stat_char = {3'h3, 3'b000, i_sw[2]};
+                        5'd5:  stat_char = {3'h3, 3'b000, i_sw[1]};
+                        5'd6:  stat_char = {3'h3, 3'b000, i_sw[0]};
+                        5'd7:  stat_char = " ";
+                        5'd8:  stat_char = "L";
+                        5'd9:  stat_char = "T";
+                        5'd10: stat_char = ":";
+                        5'd11: stat_char = {3'h3, 2'b00, sw_layer};
                         default: stat_char = 7'h20;
                     endcase
                 end
@@ -1054,6 +1055,17 @@ module osd_layer #(
     wire in_fnd = boot_mode && (x >= FND_X) && (x < FND_X + 11'd240) &&
                   (y >= FND_Y) && (y < FND_Y + 11'd16);
 
+    // "AUDIO: FOUND/NONE"（1x，FOUND IMAGES 下方）
+    localparam [10:0] AUD_X = 11'd112;
+    localparam [10:0] AUD_Y = 11'd276;
+    wire [10:0] aud_off = x - AUD_X;
+    wire [3:0]  aud_idx = aud_off[6:3];
+    wire [2:0]  aud_col = aud_off[2:0];
+    wire [10:0] aud_v   = y - AUD_Y;
+    wire [2:0]  aud_row = aud_v[2:0];
+    wire in_aud = boot_mode && (x >= AUD_X) && (x < AUD_X + 11'd128) &&
+                  (y >= AUD_Y) && (y < AUD_Y + 11'd8);
+
     // "M:0 B100% C100%"（1x）
     localparam [10:0] CFG_X = 11'd148;
     localparam [10:0] CFG_Y = 11'd292;
@@ -1148,7 +1160,7 @@ module osd_layer #(
     wire in_sth = boot_mode && (x >= STH_X) && (x < STH_X + 11'd96) &&
                   (y >= STH_Y) && (y < STH_Y + 11'd16);
 
-    // 实时状态（1x，3 行）
+    // 实时状态（1x，4 行：M/B/C、AUTO/VIZ、DM/VD、SW/LAYER）
     localparam [10:0] ST_X = 11'd456;
     localparam [10:0] ST_Y = 11'd314;
     wire [10:0] st_offx = x - ST_X;
@@ -1157,7 +1169,7 @@ module osd_layer #(
     wire [1:0]  st_line = st_offy[5:4];
     wire [2:0]  st_row  = st_offy[2:0];
     wire in_st = boot_mode && (x >= ST_X) && (x < ST_X + 11'd128) &&
-                 (y >= ST_Y) && (y < ST_Y + 11'd48) && ~st_offy[3];
+                 (y >= ST_Y) && (y < ST_Y + 11'd64) && ~st_offy[3];
 
     // ---- 启动界面字符选择 ----
     reg [6:0]  boot_char;
@@ -1202,6 +1214,46 @@ module osd_layer #(
             boot_col  = fnd_col;
             boot_text_on = 1'b1;
             boot_text_color = 24'h8CFFB0;
+        end else if (in_aud) begin
+            if (i_wav_found) begin
+                // "AUDIO: FOUND"
+                case (aud_idx)
+                    4'd0:  boot_char = "A";
+                    4'd1:  boot_char = "U";
+                    4'd2:  boot_char = "D";
+                    4'd3:  boot_char = "I";
+                    4'd4:  boot_char = "O";
+                    4'd5:  boot_char = ":";
+                    4'd6:  boot_char = " ";
+                    4'd7:  boot_char = "F";
+                    4'd8:  boot_char = "O";
+                    4'd9:  boot_char = "U";
+                    4'd10: boot_char = "N";
+                    4'd11: boot_char = "D";
+                    default: boot_char = 7'h20;
+                endcase
+                boot_text_color = 24'h8CFFB0;
+            end else begin
+                // "AUDIO: NONE"
+                case (aud_idx)
+                    4'd0:  boot_char = "A";
+                    4'd1:  boot_char = "U";
+                    4'd2:  boot_char = "D";
+                    4'd3:  boot_char = "I";
+                    4'd4:  boot_char = "O";
+                    4'd5:  boot_char = ":";
+                    4'd6:  boot_char = " ";
+                    4'd7:  boot_char = "N";
+                    4'd8:  boot_char = "O";
+                    4'd9:  boot_char = "N";
+                    4'd10: boot_char = "E";
+                    default: boot_char = 7'h20;
+                endcase
+                boot_text_color = 24'h9AA8C0;
+            end
+            boot_row  = aud_row;
+            boot_col  = aud_col;
+            boot_text_on = 1'b1;
         end else if (in_cfg) begin
             case (cfg_idx)
                 5'd0:  boot_char = "M";
@@ -1376,6 +1428,7 @@ module osd_layer #(
         .i_en        (i_rm_en && ~boot_mode),
         .i_frame_bcd (vid_bcd),
         .i_video_on  (i_video_on),
+        .i_vok       (i_vok),
         .o_txt_on    (rm_txt_on),
         .o_char      (rm_char),
         .o_row       (rm_row),
@@ -1385,10 +1438,164 @@ module osd_layer #(
         .o_bg_color  (rm_bg_color)
     );
 
+    // ======================= SW4 告警层（最高优先级）=======================
+    // 全屏警示：视频压暗染红 + 上下 45° 警示斜纹带 + 居中告警卡片。
+    // 呼吸值逐帧三角波（约 2.1s 一周期），卡片边框/标题/斜纹同步脉动。
+    localparam [10:0] WN_X0  = 11'd88;
+    localparam [10:0] WN_X1  = 11'd552;
+    localparam [10:0] WN_Y0  = 11'd160;
+    localparam [10:0] WN_Y1  = 11'd328;
+    localparam [10:0] BAND_H = 11'd56;
+
+    reg [7:0] br_lvl;
+    reg       br_up;
+    always @(posedge i_clk or posedge i_rst) begin
+        if (i_rst) begin
+            br_lvl <= 8'd0;
+            br_up  <= 1'b1;
+        end else if (vs_rise) begin
+            if (br_up) begin
+                if (br_lvl >= 8'd252) begin br_lvl <= 8'd255; br_up <= 1'b0; end
+                else                       br_lvl <= br_lvl + 8'd4;
+            end else begin
+                if (br_lvl <= 8'd3) begin br_lvl <= 8'd0; br_up <= 1'b1; end
+                else                     br_lvl <= br_lvl - 8'd4;
+            end
+        end
+    end
+    wire        wn_hi    = br_lvl[7];          // 脉动高相位
+    wire [7:0]  wn_pulse = br_lvl;
+
+    // 全屏底：视频压到 1/4 亮度，再叠一层脉动暗红（整屏都进入告警态）
+    wire [7:0]  wn_wash_r = 8'h14 + {2'b00, wn_pulse[7:2]};
+    wire [23:0] wn_wash   = {wn_wash_r, {2'b00, i_rgb[15:10]}, {2'b00, i_rgb[7:2]}};
+
+    // 上下警示斜纹带：45° 条纹，随呼吸横向流动
+    wire [11:0] band_sum    = {1'b0, x} + {1'b0, y} + {6'd0, wn_pulse[7:4]};
+    wire        band_stripe = band_sum[4];
+    wire        in_band     = (y < BAND_H) || (y >= (11'd480 - BAND_H));
+    wire        band_edge   = (y == BAND_H - 11'd1) || (y == BAND_H) ||
+                              (y == 11'd479 - BAND_H) || (y == 11'd480 - BAND_H);
+    wire [23:0] band_rgb    = band_stripe ? 24'hE8B21A : 24'h1A1206;
+
+    // 居中告警卡片：4px 脉动红边 + 2px 琥珀内线 + 深红底
+    wire        in_card    = (x >= WN_X0) && (x < WN_X1) &&
+                             (y >= WN_Y0) && (y < WN_Y1);
+    wire        card_outer = in_card &&
+                             ((x <  WN_X0 + 11'd4)  || (x >= WN_X1 - 11'd4) ||
+                              (y <  WN_Y0 + 11'd4)  || (y >= WN_Y1 - 11'd4));
+    // 内框：距外沿 10px 处一条 2px 细线（不是实心条）
+    wire        card_inner = in_card && !card_outer &&
+                             (((x >= WN_X0 + 11'd10) && (x < WN_X0 + 11'd12)) ||
+                              ((x >= WN_X1 - 11'd12) && (x < WN_X1 - 11'd10)) ||
+                              ((y >= WN_Y0 + 11'd10) && (y < WN_Y0 + 11'd12)) ||
+                              ((y >= WN_Y1 - 11'd12) && (y < WN_Y1 - 11'd10)));
+    localparam [23:0] WN_BG   = 24'h160507;
+    localparam [23:0] WN_TEXT = 24'hFFE8E8;
+    wire [23:0] wn_border_rgb = wn_hi ? 24'hFF2A2A : 24'h8C0F0F;
+    wire [23:0] wn_inner_rgb  = wn_hi ? 24'hFFC24D : 24'h6B4A10;
+
+    // 4 倍字号 "WARNING"：7 字符 × 32px = 224px，水平居中
+    localparam [10:0] WT_X = 11'd208;
+    localparam [10:0] WT_Y = 11'd176;
+    wire [10:0] wt_dx  = x - WT_X;
+    wire [10:0] wt_dy  = y - WT_Y;
+    wire        in_wt  = i_warn_en && (x >= WT_X) && (x < WT_X + 11'd224) &&
+                         (y >= WT_Y) && (y < WT_Y + 11'd32);
+    wire [4:0]  wt_idx = wt_dx[9:5];
+    wire [2:0]  wt_col = wt_dx[4:2];
+    wire [2:0]  wt_row = wt_dy[4:2];
+
+    function [6:0] wn_title_char;
+        input [4:0] i;
+        begin
+            case (i)
+                5'd0: wn_title_char = "W";
+                5'd1: wn_title_char = "A";
+                5'd2: wn_title_char = "R";
+                5'd3: wn_title_char = "N";
+                5'd4: wn_title_char = "I";
+                5'd5: wn_title_char = "N";
+                5'd6: wn_title_char = "G";
+                default: wn_title_char = 7'h20;
+            endcase
+        end
+    endfunction
+
+    // 2 倍字号 4 行说明：行距 24px，首行 15 字符居中，其余 19 字符
+    reg [1:0] wl_line;
+    always @(*) begin
+        if      (y < 11'd240) wl_line = 2'd0;
+        else if (y < 11'd264) wl_line = 2'd1;
+        else if (y < 11'd288) wl_line = 2'd2;
+        else                  wl_line = 2'd3;
+    end
+    reg [10:0] wl_ly, wl_x0;
+    always @(*) begin
+        case (wl_line)
+            2'd0:    begin wl_ly = 11'd216; wl_x0 = 11'd200; end
+            2'd1:    begin wl_ly = 11'd240; wl_x0 = 11'd168; end
+            2'd2:    begin wl_ly = 11'd264; wl_x0 = 11'd168; end
+            default: begin wl_ly = 11'd288; wl_x0 = 11'd168; end
+        endcase
+    end
+    wire [10:0] wl_dx  = x - wl_x0;
+    wire [10:0] wl_dy  = y - wl_ly;
+    wire        in_wl  = i_warn_en && (y >= wl_ly) && (y < wl_ly + 11'd16) &&
+                         (x >= wl_x0) && (x < wl_x0 + 11'd304);
+    wire [4:0]  wl_idx = wl_dx[8:4];
+    wire [2:0]  wl_col = wl_dx[3:1];
+    wire [2:0]  wl_row = wl_dy[3:1];
+
+    function [6:0] wl_char;
+        input [1:0] ln;
+        input [4:0] i;
+        begin
+            wl_char = 7'h20;
+            case (ln)
+            2'd0: case (i)                                  // "EMERGENCY ALERT"
+                5'd0: wl_char = "E";  5'd1: wl_char = "M";  5'd2: wl_char = "E";
+                5'd3: wl_char = "R";  5'd4: wl_char = "G";  5'd5: wl_char = "E";
+                5'd6: wl_char = "N";  5'd7: wl_char = "C";  5'd8: wl_char = "Y";
+                5'd10: wl_char = "A"; 5'd11: wl_char = "L"; 5'd12: wl_char = "E";
+                5'd13: wl_char = "R"; 5'd14: wl_char = "T";
+                default: ;
+            endcase
+            2'd1: case (i)                                  // "SYSTEM IS IN DANGER"
+                5'd0: wl_char = "S";  5'd1: wl_char = "Y";  5'd2: wl_char = "S";
+                5'd3: wl_char = "T";  5'd4: wl_char = "E";  5'd5: wl_char = "M";
+                5'd7: wl_char = "I";  5'd8: wl_char = "S";  5'd10: wl_char = "I";
+                5'd11: wl_char = "N"; 5'd13: wl_char = "D"; 5'd14: wl_char = "A";
+                5'd15: wl_char = "N"; 5'd16: wl_char = "G"; 5'd17: wl_char = "E";
+                5'd18: wl_char = "R";
+                default: ;
+            endcase
+            2'd2: case (i)                                  // "ACTION REQUIRED NOW"
+                5'd0: wl_char = "A";  5'd1: wl_char = "C";  5'd2: wl_char = "T";
+                5'd3: wl_char = "I";  5'd4: wl_char = "O";  5'd5: wl_char = "N";
+                5'd7: wl_char = "R";  5'd8: wl_char = "E";  5'd9: wl_char = "Q";
+                5'd10: wl_char = "U"; 5'd11: wl_char = "I"; 5'd12: wl_char = "R";
+                5'd13: wl_char = "E"; 5'd14: wl_char = "D"; 5'd16: wl_char = "N";
+                5'd17: wl_char = "O"; 5'd18: wl_char = "W";
+                default: ;
+            endcase
+            default: case (i)                               // "CHECK THE EQUIPMENT"
+                5'd0: wl_char = "C";  5'd1: wl_char = "H";  5'd2: wl_char = "E";
+                5'd3: wl_char = "C";  5'd4: wl_char = "K";  5'd6: wl_char = "T";
+                5'd7: wl_char = "H";  5'd8: wl_char = "E";  5'd10: wl_char = "E";
+                5'd11: wl_char = "Q"; 5'd12: wl_char = "U"; 5'd13: wl_char = "I";
+                5'd14: wl_char = "P"; 5'd15: wl_char = "M"; 5'd16: wl_char = "E";
+                5'd17: wl_char = "N"; 5'd18: wl_char = "T";
+                default: ;
+            endcase
+            endcase
+        end
+    endfunction
+
     // ---- 统一字符源（优先级：顶栏 > 底栏 > 弹幕 > 资源面板 > 启动面板）----
     localparam [2:0] S_NONE = 3'd0, S_BOOT = 3'd1, S_TITLE = 3'd2,
                      S_TS   = 3'd3, S_BOT  = 3'd4, S_DM    = 3'd5,
-                     S_RM   = 3'd6;
+                     S_RM   = 3'd6, S_WARN = 3'd7;
 
     reg [2:0]  t_src;
     reg [6:0]  t_char;
@@ -1402,7 +1609,14 @@ module osd_layer #(
         t_row   = 3'd0;
         t_col   = 3'd0;
         t_color = 24'hFFFFFF;
-        if (in_title) begin
+        if (in_wt) begin
+            t_src = S_WARN; t_char = wn_title_char(wt_idx); t_row = wt_row;
+            t_col = wt_col;
+            t_color = wn_hi ? 24'hFFFFFF : 24'hFFE2A0;
+        end else if (in_wl) begin
+            t_src = S_WARN; t_char = wl_char(wl_line, wl_idx); t_row = wl_row;
+            t_col = wl_col; t_color = WN_TEXT;
+        end else if (in_title) begin
             t_src = S_TITLE; t_char = title_char; t_row = title_row;
             t_col = title_col; t_color = 24'hFFFFFF;
         end else if (in_ts) begin
@@ -1435,11 +1649,20 @@ module osd_layer #(
     wire bot_px  = t_px && (t_src == S_BOT);
     wire dm_px   = t_px && (t_src == S_DM);
     wire rm_px   = t_px && (t_src == S_RM);
+    wire wn_px   = t_px && (t_src == S_WARN);
 
     // ---- 输出混合 ----
     reg [23:0] rgb_next;
     always @(*) begin
-        if (in_lp_border)
+        if (i_warn_en) begin
+            // 全屏接管：斜纹带 > 卡片边框/内线/底色 > 整屏压暗染红
+            if (wn_px)           rgb_next = t_color;
+            else if (in_band)    rgb_next = band_edge ? 24'hFF3838 : band_rgb;
+            else if (in_card)    rgb_next = card_outer ? wn_border_rgb :
+                                             card_inner ? wn_inner_rgb : WN_BG;
+            else                 rgb_next = wn_wash;
+        end
+        else if (in_lp_border)
             rgb_next = mq_lit ? mq_color : 24'h101A2E;
         else if (in_lp) begin
             if (in_prg) begin

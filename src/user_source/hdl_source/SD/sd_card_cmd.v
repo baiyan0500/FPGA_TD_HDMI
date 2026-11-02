@@ -43,6 +43,8 @@ parameter S_WRITE_BUSY   = 14;
 parameter S_WRITE_ACK    = 15;
 parameter S_ERR          = 16;
 parameter S_END          = 17;
+parameter S_STOP_CMD     = 18;   // CMD18 流结束：发 CMD12（STOP_TRANSMISSION）
+parameter S_STOP_BUSY    = 19;   // 等 DO 回到 0xFF（卡内部停止操作完成）
 
 reg[4:0]                      state;
 reg                           CS_reg;
@@ -51,6 +53,7 @@ reg[7:0]                      send_data;
 wire[7:0]                     data_recv;
 reg[9:0]                      wr_data_cnt;
 reg[15:0]                     sec_left;          //本批剩余扇区数（不含当前扇区）
+reg                           stream_rd;         //本批为 CMD18 流式读（>1 扇区）
 
 assign cmd_req_ack = (state == S_END);
 assign block_read_req_ack = (state == S_READ_ACK);
@@ -72,6 +75,7 @@ begin
 		cmd_req_error <= 1'b0;
 		wr_data_cnt <= 10'd0;
 		sec_left <= 16'd0;
+		stream_rd <= 1'b0;
 	end
 	else
 		case(state)
@@ -112,8 +116,9 @@ begin
 				else if(block_read_req == 1'b1)
 				begin
 					// 单条 CMD18 连续读多个扇区；扇区数在请求时锁存
-					sec_left <= (block_read_secs <= 16'd1) ? 16'd0 : (block_read_secs - 16'd1);
-					state    <= S_READ_WAIT;
+					sec_left  <= (block_read_secs <= 16'd1) ? 16'd0 : (block_read_secs - 16'd1);
+					stream_rd <= (block_read_secs > 16'd1);
+					state     <= S_READ_WAIT;
 				end
 				else if(block_write_req == 1'b1)
 					state <= S_WRITE_TOKEN;
@@ -234,9 +239,12 @@ begin
 					// 512 数据 + 2 字节 CRC 全部吃掉，保证 CMD18 下一块 token 对齐
 					if(byte_cnt == 16'd513)
 					begin
-						state <= S_READ_ACK;
+						// CMD18 流的最后一块不直接进 S_READ_ACK：block_read_req_ack
+						// 必须等 CMD12 真正终止流之后才给（ack 是组合输出，
+						// 提前进入会立刻脉冲给上层）
+						state      <= (stream_rd && sec_left == 16'd0) ? S_STOP_CMD : S_READ_ACK;
 						spi_wr_req <= 1'b0;
-						byte_cnt <= 16'd0;
+						byte_cnt   <= 16'd0;
 					end
 					else
 					begin
@@ -342,6 +350,60 @@ begin
 				state <= S_END;
 				cmd_req_error <= 1'b1;
 			end
+			S_STOP_CMD:
+			begin
+				// CMD12 = STOP_TRANSMISSION：6 字节 0x4C 00 00 00 00 FF，CS 保持低。
+				// 发送期间完全无视 DO——流模式下卡还在往外吐数据残片，
+				// 任何按 R1 判错的检查都可能把终止命令截断
+				if(spi_wr_ack == 1'b1)
+				begin
+					if(byte_cnt == 16'd5)
+					begin
+						spi_wr_req <= 1'b0;
+						byte_cnt   <= 16'd0;
+						state      <= S_STOP_BUSY;
+					end
+					else
+						byte_cnt <= byte_cnt + 16'd1;
+				end
+				else
+				begin
+					spi_wr_req <= 1'b1;
+					CS_reg    <= 1'b0;
+					case(byte_cnt)
+						16'd0:    send_data <= 8'h4C;   // 12 | 0x40
+						16'd1,
+						16'd2,
+						16'd3,
+						16'd4:    send_data <= 8'h00;
+						default:  send_data <= 8'hff;   // CRC dummy
+					endcase
+				end
+			end
+			S_STOP_BUSY:
+			begin
+				// R1b：卡收到 CMD12 后拉低 DO 表示 busy，回 0xFF 即停止完成。
+				// 带超时兜底（~64 字节仍忙则放弃，避免坏卡锁死整个状态机）
+				if(spi_wr_ack == 1'b1 && data_recv == 8'hff)
+				begin
+					spi_wr_req <= 1'b0;
+					byte_cnt   <= 16'd0;
+					state      <= S_READ_ACK;
+				end
+				else if(spi_wr_ack == 1'b1 && byte_cnt >= 16'd63)
+				begin
+					spi_wr_req <= 1'b0;
+					byte_cnt   <= 16'd0;
+					state      <= S_READ_ACK;
+				end
+				else
+				begin
+					spi_wr_req <= 1'b1;
+					send_data  <= 8'hff;
+					if(spi_wr_ack == 1'b1)
+						byte_cnt <= byte_cnt + 16'd1;
+				end
+			end
 			S_READ_ACK:
 			begin
 				// 流式读：还有扇区就继续等下一个 token（不再发命令）
@@ -353,7 +415,8 @@ begin
 				end
 				else
 				begin
-					// 流结束：抬 CS 终止 CMD18 连续读，下一命令前的哑字节提供恢复时钟
+					// 流结束：CMD18 已由 CMD12 终止（或本就是 CMD17 单读），
+					// 抬 CS 结束本次传输，下一命令前的哑字节提供恢复时钟
 					CS_reg <= 1'b1;
 					state  <= S_WAIT;
 				end

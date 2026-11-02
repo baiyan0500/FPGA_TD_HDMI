@@ -184,12 +184,13 @@ reg [1:0] sz_cnt;
 
 // sd_sec_data_valid 由 SD 核 state 组合译码（约 4 级 LUT），若直连 parse_en，
 // 解析寄存器的 CE 形成 10.5ns 长链（SWNS -0.668ns）。头字段字节间隔约 360ns，
-// 解析晚一拍没有任何影响；用 data_last 提前拦住末尾 size 字节，
-// 保证与直连版本逐字节等价（否则会多解析 1 个 payload 字节）。
+// 解析晚一拍没有任何影响。注意不能在这里拦"末尾 size 字节"：拦住 parse_en
+// 会同时拦住 sz_cnt/data_seen 的状态更新，解析器将永久冻结在 data_last=1，
+// W_HDR 无限读扇区并霸占总线（上电首图永不提交的根因）。!data_seen 已足以
+// 保证与直连版本逐字节等价：s3 在 T3 拍被 pvalid 放行、T3+1 拍解析并置位
+// data_seen，下一字节到达时（≥360ns 后）门控已闭合。
 reg [7:0] pdata;
 reg       pvalid;
-wire      data_last = (pst == P_SIZE) && (sz_cnt == 2'd3) &&
-                      ({id3, id2, id1, id0} == "data");
 
 always @(posedge clk or posedge rst) begin
     if (rst) begin
@@ -197,7 +198,7 @@ always @(posedge clk or posedge rst) begin
         pvalid <= 1'b0;
     end else begin
         pdata  <= sd_sec_data;
-        pvalid <= (state == W_HDR) && sd_sec_data_valid && !data_seen && !data_last;
+        pvalid <= (state == W_HDR) && sd_sec_data_valid && !data_seen;
     end
 end
 

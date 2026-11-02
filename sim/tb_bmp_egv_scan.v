@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 // 验证 bmp_read 的 EGV1 识别（bug2：容器位置靠扫描魔数确定，不再依赖编译期 LBA）
-//   A) total_bytes 跳转越过 scan_max：扫描立即结束，egv_found/起始扇区正确
+//   A) total_bytes 跳转越过 scan_max：不得提前收工——退化为 4KB 步进继续扫，
+//      窗口内 EGV 之后的 WAV/BMP 仍能被发现（实卡布局：EGV@47360、WAV@58624
+//      落在容器物理跨度内的间隙；旧版在 EGV 跳转越界时直接 scan_done，
+//      WAV 永远扫不到 → 音频只能播系统测试音）
 //   B) 跳转落在窗口内：后续 BMP 仍能被找到，且中间扇区一个都不读
 //   C) total_bytes=0 的畸形头：至少前进 8 扇区，扫描不会锁死
 module tb_bmp_egv_scan;
@@ -63,8 +66,10 @@ module tb_bmp_egv_scan;
     // ---------------- 场景配置 ----------------
     integer egv_lba = 16;
     integer bmp_lba = 416;
+    integer wav_lba = 40;                  // EGV 之后、容器跨度内的间隙（场景 A）
     reg [31:0] egv_total_bytes = 32'd4_000_000;
     reg [31:0] bmp_file_len = 32'd921654;
+    reg [31:0] wav_riff_size = 32'd1000;
 
     function [7:0] mem_byte(input [31:0] sec, input integer off);
         begin
@@ -83,6 +88,22 @@ module tb_bmp_egv_scan;
                     37: mem_byte = egv_total_bytes[15:8];
                     38: mem_byte = egv_total_bytes[23:16];
                     39: mem_byte = egv_total_bytes[31:24];
+                    default: mem_byte = 8'd0;
+                endcase
+            end else if (sec == wav_lba) begin
+                case (off)
+                    0: mem_byte = "R";
+                    1: mem_byte = "I";
+                    2: mem_byte = "F";
+                    3: mem_byte = "F";
+                    4: mem_byte = wav_riff_size[7:0];
+                    5: mem_byte = wav_riff_size[15:8];
+                    6: mem_byte = wav_riff_size[23:16];
+                    7: mem_byte = wav_riff_size[31:24];
+                    8: mem_byte = "W";
+                    9: mem_byte = "A";
+                    10: mem_byte = "V";
+                    11: mem_byte = "E";
                     default: mem_byte = 8'd0;
                 endcase
             end else if (sec == bmp_lba) begin
@@ -191,21 +212,34 @@ module tb_bmp_egv_scan;
     endtask
 
     initial begin
-        // ---- 场景 A：跳转越过 scan_max ----
+        // ---- 场景 A：跳转越过 scan_max → 退化为步进，窗口内 WAV/BMP 仍被发现 ----
         egv_total_bytes = 32'd4_000_000;      // 7813 扇区 → 16+7813 > 5000
         scan_max_sector = 32'd5000;
         reset_dut;
         do_scan;
-        if (nreq !== 3) begin
-            $display("FAIL A: nreq=%0d exp 3", nreq); err = err + 1;
+        // 0,8,16 命中 EGV → 跳转越界，步进 24,32 → 40 命中 WAV →
+        // 跳 2 扇区读 42（miss）→ 对齐步进 48..408（46 拍）→ 416 命中 BMP
+        // （目标 1 且 wav_found）→ 收工。共 54 次读
+        if (nreq !== 54) begin
+            $display("FAIL A: nreq=%0d exp 54", nreq); err = err + 1;
         end
         check_req(0, 0); check_req(1, 8); check_req(2, 16);
+        check_req(3, 24); check_req(4, 32); check_req(5, 40);
+        check_req(6, 42);
+        check_req(53, 416);
         if (egv_found !== 1'b1 || egv_start_sector !== 32'd16) begin
             $display("FAIL A: egv_found=%b start=%0d", egv_found, egv_start_sector);
             err = err + 1;
         end
-        if (scan_found_total !== 5'd0) begin
-            $display("FAIL A: found_total=%0d", scan_found_total); err = err + 1;
+        // 音频问题回归：EGV 跳转越界绝不能把 WAV 挡在扫描窗口外
+        if (wav_found !== 1'b1 || wav_start_sector !== 32'd40) begin
+            $display("FAIL A: wav_found=%b start=%0d exp 40", wav_found, wav_start_sector);
+            err = err + 1;
+        end
+        if (scan_found_total !== 5'd1 || scan_found_sector !== 32'd416) begin
+            $display("FAIL A: found_total=%0d sector=%0d",
+                     scan_found_total, scan_found_sector);
+            err = err + 1;
         end
         if (sd_sec_read) begin
             $display("FAIL A: still reading after done"); err = err + 1;
@@ -232,15 +266,17 @@ module tb_bmp_egv_scan;
         end
 
         // ---- 场景 C：total_bytes=0 → 至少前进 8 扇区，扫描不锁死 ----
+        // 40 现在是 WAV（场景 A 复用布局）：命中后跳 2 扇区读 42，
+        // 42 >= scan_max(40) → 收工
         egv_total_bytes = 32'd0;
         scan_max_sector = 32'd40;
         reset_dut;
         do_scan;
-        if (nreq !== 6) begin
-            $display("FAIL C: nreq=%0d exp 6", nreq); err = err + 1;
+        if (nreq !== 7) begin
+            $display("FAIL C: nreq=%0d exp 7", nreq); err = err + 1;
         end
         check_req(0, 0); check_req(1, 8); check_req(2, 16);
-        check_req(3, 24); check_req(4, 32); check_req(5, 40);
+        check_req(3, 24); check_req(4, 32); check_req(5, 40); check_req(6, 42);
         if (egv_found !== 1'b1 || egv_start_sector !== 32'd16) begin
             $display("FAIL C: egv_found=%b start=%0d", egv_found, egv_start_sector);
             err = err + 1;

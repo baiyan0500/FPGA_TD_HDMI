@@ -2,7 +2,7 @@
 module sd_card_bmp #(
     parameter integer CLK_FREQ_HZ       = 100_000_000,
     parameter [31:0]  SCAN_START_SECTOR = 32'd0,
-    parameter [31:0]  SCAN_MAX_SECTOR   = 32'd131071,
+    parameter [31:0]  SCAN_MAX_SECTOR   = 32'd262143,
     parameter [4:0]   SCAN_TARGET_COUNT = 5'd16
 )(
     input                       clk,
@@ -17,6 +17,7 @@ module sd_card_bmp #(
     output      [4:0]           img_count,
     output                      sd_ready,
     output                      scan_done_o,
+    output                      o_wav_found,        // 扫描发现 WAV 文件（菜单显示用）
     output                      o_egv_found,        // 扫描发现 EGV1 容器
     output [31:0]               o_egv_start_sector, // EGV1 起始扇区（容器头）
 
@@ -101,6 +102,7 @@ wire [31:0]      wav_sd_addr;
 wire             wav_data_valid;
 wire             wav_read_end;
 wire             wav_pause_s;
+assign o_wav_found = wav_found;
 reg  [1:0]       wav_pause_sync;
 
 // ---- SD 总线仲裁 ----
@@ -166,8 +168,9 @@ reg [4:0]        img_found_count;      // 0..16（比表项多 1，便于判断"
 reg [3:0]        img_idx;              // 当前真正显示中的图片编号
 reg [3:0]        load_idx;             // 当前正在写入的图片编号
 reg [1:0]        pending_buf_idx;      // 当前正在写入的目标缓冲区
-// 图片起始扇区表（16 张）。本卡 SCAN_MAX_SECTOR=131071，18bit 足够（256MB 上限），
-// 比 32bit 省 224 个触发器——当前 slice 占用已超 90%
+// 图片起始扇区表（16 张）。SCAN_MAX_SECTOR=262143 是 18bit 能表示的上限
+// （262144 扇区 = 128MB）；再扩大扫描窗口必须同时把这些表加宽。
+// 比 32bit 省 224 个触发器——当前 slice 占用已超 97%。
 reg [17:0]       img_sector0;
 reg [17:0]       img_sector1;
 reg [17:0]       img_sector2;

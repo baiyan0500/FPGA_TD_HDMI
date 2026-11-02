@@ -32,6 +32,7 @@ module tb_osd_layer;
     reg        disp_valid = 0;
     reg        sd_done = 1, scan_done = 1;
     reg [4:0]  img_cnt = 5'd3;
+    reg        wav_fnd = 1;
     reg [15:0] src_w = 16'h0640, src_h = 16'h0480;
     reg        src_tgl = 0;
     reg        auto_play = 0;
@@ -41,7 +42,7 @@ module tb_osd_layer;
 
     osd_layer dut (
         .i_clk(clk), .i_rst(rst), .i_hs(hs), .i_vs(vs), .i_de(de), .i_rgb(rgb),
-        .i_mode(mode), .i_bright(bright), .i_contrast(contrast),
+        .i_mode(mode), .i_bright(bright), .i_contrast(contrast), .i_sw(4'b0011),
         .i_slogan(slogan), .i_slogan_len(slen), .i_slogan_dir(sdir),
         .i_slogan_update(supd), .i_slogan_scroll(sscroll),
         .i_viz_mode(viz), .i_spec_en(spec_en), .i_audio_level(alevel),
@@ -50,9 +51,10 @@ module tb_osd_layer;
         .i_dm_color(dm_color), .i_dm_tgl(dm_tgl), .o_dm_ack(dm_ack),
         .i_rm_en(rm_en), .i_video_on(video_on), .i_vid_ftgl(vid_ftgl),
         .i_display_valid(disp_valid), .i_sd_init_done(sd_done),
-        .i_scan_done(scan_done), .i_img_count(img_cnt),
+        .i_scan_done(scan_done), .i_img_count(img_cnt), .i_wav_found(wav_fnd),
         .i_src_w_bcd(src_w), .i_src_h_bcd(src_h), .i_src_tgl(src_tgl),
         .i_auto_play(auto_play),
+        .i_warn_en(1'b0),
         .o_hs(ohs), .o_vs(ovs), .o_de(ode), .o_rgb(orgb)
     );
 

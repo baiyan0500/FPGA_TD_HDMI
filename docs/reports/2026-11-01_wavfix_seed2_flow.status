@@ -1,0 +1,24 @@
+Location         : C:\FPGA_projects\Contest\merged\src\td_project\check_Runs\phy_v15\seed_2
+Running with     : Tang Dynasty v6.2.168116
+                   Copyright (c) 2012-2025 Anlogic Inc.
+Top Model        : top
+Device           : EG4S20BG256
+Speed            : NA
+
+Timing Mode      : final
+Setup            : WNS   186ps  TNS        0ps  NUM_FEPS     0
+Hold             : WNS    20ps  TNS        0ps  NUM_FEPS     0
+
+Flow Statistics  :
+---------------------------------------------------------------------------------------------------
+     command     |  #calls  |  wall time   |  cpu time(s)  |  used memory(mb)  |  peak memory(mb)  
+---------------------------------------------------------------------------------------------------
+      route      |    1     |  1m16s(58%)  |   121(50%)    |       1108        |       1108        
+      place      |    1     |   46s(35%)   |    73(30%)    |        691        |        691        
+    fix_hold     |    1     |    5s(3%)    |     5(2%)     |       1109        |       1109        
+     bitgen      |    1     |    3s(2%)    |    39(16%)    |       1114        |       1114        
+    import_db    |    1     |    0s(0%)    |     0(0%)     |        267        |        267        
+  import_device  |    1     |    0s(0%)    |     0(0%)     |        83         |        83         
+---------------------------------------------------------------------------------------------------
+      total      |    6     |    2m10s     |      238      |       1114        |       1114        
+---------------------------------------------------------------------------------------------------

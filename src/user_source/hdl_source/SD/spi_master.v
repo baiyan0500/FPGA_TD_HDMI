@@ -121,6 +121,26 @@ begin
 		else if(CPHA == 1'b1 && (clk_edge_cnt != 5'd0 && clk_edge_cnt[0] == 1'b0))
 			MOSI_shift <= {MOSI_shift[6:0],MOSI_shift[7]};
 end
+//SPI 采样点延后一拍（2026-11-02）
+//  原来在 DCLK 翻转那一拍同时采 MISO：实卡的 tODLY(2~14ns)+FPGA 输出/输入
+//  缓冲延迟≈5~10ns 一起吃掉半个 DCLK 周期(25MHz 下只有 20ns)，留给卡到
+//  输入寄存器的建立时间只剩 0~8ns，边界卡会偶发错位/错字节（花屏彩条 +
+//  音频爆音同时出现）。改到翻转后的一拍(=+10ns)采，采在数据窗口正中：
+//  建立时间≈6~18ns，且距下一个翻转沿仍有 10ns，不会撞上卡换数据。
+//  低速率阶段(clk_div=248, 半周期 2.5us)同样安全。
+reg miso_pend;
+always@(posedge sys_clk or posedge rst)
+begin
+	if(rst)
+		miso_pend <= 1'b0;
+	else if(state == DCLK_EDGE)
+		if(CPHA == 1'b0)
+			miso_pend <= (clk_edge_cnt[0] == 1'b0);
+		else
+			miso_pend <= (clk_edge_cnt[0] == 1'b1);
+	else
+		miso_pend <= 1'b0;
+end
 //SPI data input
 always@(posedge sys_clk or posedge rst)
 begin
@@ -128,10 +148,7 @@ begin
 		MISO_shift <= 8'd0;
 	else if(state == IDLE && wr_req)
 		MISO_shift <= 8'h00;
-	else if(state == DCLK_EDGE)
-		if(CPHA == 1'b0 && clk_edge_cnt[0] == 1'b0)
-			MISO_shift <= {MISO_shift[6:0],MISO};
-		else if(CPHA == 1'b1 && (clk_edge_cnt[0] == 1'b1))
-			MISO_shift <= {MISO_shift[6:0],MISO};
+	else if(miso_pend)
+		MISO_shift <= {MISO_shift[6:0],MISO};
 end
 endmodule

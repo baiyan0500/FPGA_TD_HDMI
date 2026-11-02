@@ -82,7 +82,13 @@ module tb_sd_timing;
     reg        is_read    = 1'b0;
     reg        is_stream  = 1'b0;
 
-    assign SD_MISO = txb[7];
+    // 卡片数据输出延迟 tODLY（0 延时模型会掩盖 master 采样点问题：
+    // 真实卡在下降沿之后 2~15ns 才把新数据送到 MISO，且必须一直保持到
+    // 下一个下降沿。这里给 15ns，既覆盖最坏 tODLY，也让"最后一个 bit 在
+    // 上升沿被 handle_byte 改掉"这种零延时假象无法蒙混过关）
+    wire #15 SD_MISO_d;
+    assign SD_MISO_d = txb[7];
+    assign SD_MISO   = SD_MISO_d;
 
     always @(posedge SD_nCS) if (dbg > 1) $display("[%0t] CS high", $time);
     always @(negedge SD_nCS) if (dbg > 1) $display("[%0t] CS low", $time);
@@ -91,11 +97,13 @@ module tb_sd_timing;
     always @(negedge SD_nCS)
         bitc <= 3'd0;
 
-    // CS 上升沿：终止连续读（真实卡抬 CS 即中止 CMD18 流）
+    // CS 上升沿：字节边界复位。注意真实卡抬 CS 并不会终止 CMD18 流——
+    // 流必须由 CMD12 (STOP_TRANSMISSION) 终止；流未终止时卡仍处于数据发送态，
+    // 重新选中后发来的新命令在 DO 上只能读出数据残留，得不到合法 R1。
+    // is_stream 因此只在 CMD12 时清除（见 do_cmd），守住"忘发 CMD12"回归
     always @(posedge SD_nCS) begin
-        ph        <= 3'd0;
-        txb       <= 8'hFF;
-        is_stream <= 1'b0;
+        ph  <= 3'd0;
+        txb <= 8'hFF;
     end
 
     // 上升沿采样 MOSI
@@ -118,10 +126,16 @@ module tb_sd_timing;
             case (ph)
             3'd0: begin
                 if (b[7:6] == 2'b01) begin
-                    ph        = 3'd1;
-                    cmd_bytes = 3'd1;
-                    cmdq      = {b, 40'd0};
-                    txb       = 8'hFF;
+                    if (is_stream && b[5:0] != 6'd12) begin
+                        // CMD18 流未终止就发新命令：DO 上是数据残留（0x00，
+                        // bit7=0），不是 R1。合法 DUT 应先发 CMD12 停流
+                        txb = 8'h00;
+                    end else begin
+                        ph        = 3'd1;
+                        cmd_bytes = 3'd1;
+                        cmdq      = {b, 40'd0};
+                        txb       = 8'hFF;
+                    end
                 end
             end
             3'd1: begin
@@ -168,7 +182,15 @@ module tb_sd_timing;
                     txb = 8'hFF;
             end
             3'd4: begin
-                if (dleft == 0) begin
+                if (b == 8'h4C && is_stream) begin
+                    // 流式输出期间收到 CMD12：真实卡在完成当前块后停止输出。
+                    // 模型直接切到命令接收（DUT 读完最后一块才发 CMD12，
+                    // 最多刚开头一个新 token，丢弃不影响数据正确性）
+                    ph        = 3'd1;
+                    cmd_bytes = 3'd1;
+                    cmdq      = {b, 40'd0};
+                    txb       = 8'hFF;
+                end else if (dleft == 0) begin
                     // 本块结束：流式读继续下一扇区，否则回空闲
                     if (is_stream) begin
                         cur_lba = cur_lba + 32'd1;
@@ -209,6 +231,11 @@ module tb_sd_timing;
                     txb = (init_tries >= 4'd2) ? 8'h00 : 8'h01;
                 end
                 6'd16: txb = 8'h00;
+                6'd12: begin
+                    // STOP_TRANSMISSION：终止 CMD18 流，回 R1=0x00
+                    //（随后 DO 回 0xFF，DUT 靠此判断停止完成）
+                    txb = 8'h00;
+                end
                 6'd17: begin
                     txb     = 8'h00;
                     is_read = 1'b1;

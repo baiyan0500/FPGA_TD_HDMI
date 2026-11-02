@@ -38,8 +38,21 @@ module ctrl (
     output reg         o_video_play, // 层3：视频播放
     output reg         o_danmaku_en, // 层3：弹幕
     output reg         o_spectrum_en,// 层3：频谱
-    output reg         o_resmon_en   // 层3：资源面板
+    output reg         o_resmon_en,  // 层3：资源面板
+    output reg         o_warn_en     // SW4：最高优先级告警层（独立于功能层）
 );
+
+    // SW4 为准静态拨码，2 级同步后只作显示层使能，不参与按键分层
+    reg [1:0] warn_sync;
+    always @(posedge i_clk or posedge i_rst) begin
+        if (i_rst) begin
+            warn_sync <= 2'd0;
+            o_warn_en <= 1'b0;
+        end else begin
+            warn_sync <= {warn_sync[0], i_sw[3]};
+            o_warn_en <= warn_sync[1];
+        end
+    end
 
     wire k1_press, k2_press, k3_press, k4_press;
 

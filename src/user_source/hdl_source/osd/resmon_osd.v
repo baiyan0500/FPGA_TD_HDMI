@@ -21,6 +21,7 @@ module resmon_osd #(
     input  wire        i_en,          // 面板使能（已含层判断）
     input  wire [19:0] i_frame_bcd,   // 0~99999 BCD，5 位
     input  wire        i_video_on,
+    input  wire        i_vok,         // 1=最近一帧源像素数恰好 320*148（SD 数据完整）
 
     output wire        o_txt_on,
     output wire [6:0]  o_char,
@@ -231,6 +232,10 @@ module resmon_osd #(
                 5'd7: info_char = i_video_on ? "U" : "T";
                 5'd8: info_char = i_video_on ? "N" : "O";
                 5'd9: info_char = i_video_on ? 7'h20 : "P";
+                // 帧完整性自证位：OK = 本帧源像素数恰好 320*148（SD 读回数据完整）
+                5'd10: info_char = 7'h20;
+                5'd11: info_char = i_vok ? "O" : "N";
+                5'd12: info_char = i_vok ? "K" : "G";
                 default: info_char = 7'h20;
             endcase
         end
@@ -272,7 +277,9 @@ module resmon_osd #(
             t_char  = info_char;
             t_row   = i_y[2:0];
             t_col   = in_dx[2:0];
-            t_color = in1_row ? 24'h9BE8FF : (i_video_on ? 24'h5CFF7A : 24'hFF7B7B);
+            t_color = in1_row ? 24'h9BE8FF :
+                      (!i_video_on)            ? 24'hFF7B7B :
+                      ((in_idx >= 5'd11) && !i_vok) ? 24'hFF5252 : 24'h5CFF7A;
         end
     end
 

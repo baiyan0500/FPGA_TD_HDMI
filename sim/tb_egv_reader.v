@@ -33,7 +33,8 @@ module tb_egv_reader;
     wire [15:0] o_frame_no;
     wire        o_active;
 
-    egv_reader #(.FRAME_CYC(23'd210)) dut (
+    // LOOP_PLAY=0：本 TB 回归的是"末帧冻结 + K1 重播"，循环播放另由 tb_egv_loop 覆盖
+    egv_reader #(.FRAME_CYC(23'd210), .LOOP_PLAY(0)) dut (
         .clk(clk), .rst(rst), .i_play(play), .i_sd_ready(sd_ready),
         .i_fill_ready(fill_ready),
         .i_scan_done(scan_done), .i_egv_found(egv_found), .i_egv_lba(egv_lba),
@@ -46,6 +47,50 @@ module tb_egv_reader;
     );
 
     always #5 clk = ~clk;
+
+    // ---------------- 容器头（编译期 LBA 处）----------------
+    // 本 TB 验证编译期段表回退：头魔数有效但宽度字段损坏 → M_CONST。
+    reg [7:0] hdr_mem [0:511];
+    reg       hdr_phase = 1'b1;     // 第一次 read_end 是容器头
+    integer   hh;
+
+    task hdr_w32;
+        input integer off;
+        input [31:0] v;
+        begin
+            hdr_mem[off+0] = v[7:0];   hdr_mem[off+1] = v[15:8];
+            hdr_mem[off+2] = v[23:16]; hdr_mem[off+3] = v[31:24];
+        end
+    endtask
+
+    task build_hdr;
+        begin
+            for (hh = 0; hh < 512; hh = hh + 1) hdr_mem[hh] = 8'h00;
+            hdr_mem[0] = "E"; hdr_mem[1] = "G";
+            hdr_mem[2] = "V"; hdr_mem[3] = "1";
+            hdr_mem[4] = 8'd2; hdr_mem[5] = 8'd0;
+            // 宽度字段故意错 1 → 头部校验失败 → 编译期段表回退
+            hdr_mem[6] = (`EGV_W + 1) & 8'hFF;
+            hdr_mem[7] = ((`EGV_W + 1) >> 8) & 8'hFF;
+            hdr_mem[8] = `EGV_H & 8'hFF;  hdr_mem[9] = (`EGV_H >> 8) & 8'hFF;
+            hdr_mem[10] = `EGV_FPS;       hdr_mem[11] = 8'd0;
+            hdr_w32(12, `EGV_FRAMES);
+            hdr_w32(16, `EGV_BLOCK_SECTORS * 512);
+            hdr_w32(20, `EGV_VIDEO_BYTES);
+            hdr_w32(24, `EGV_AUDIO_BYTES);
+            hdr_mem[28] = 8'h80; hdr_mem[29] = 8'hBB;
+            hdr_mem[30] = 8'd2;  hdr_mem[31] = 8'd0;
+            hdr_w32(32, `EGV_BLOCK_SECTORS);
+            hdr_w32(34, `EGV_AUDIO_MOD);
+            hdr_mem[40] = `EGV_NRUNS; hdr_mem[41] = 8'd0;
+            hdr_w32(48, 256);             // run0 nsec（含头扇区）
+            hdr_w32(52, `EGV_BASE_LBA);
+            hdr_w32(60, `EGV_RG2 - `EGV_RG1);
+            hdr_w32(64, `EGV_RP1);
+            hdr_w32(72, `EGV_FRAMES * `EGV_BLOCK_SECTORS - `EGV_RG2);
+            hdr_w32(76, `EGV_RP2);
+        end
+    endtask
 
     // ---------------- SD 扇区读模型 ----------------
     // 注意：reader 在 read_end 同拍更新 o_sd_addr，故必须等 busy 拉高后再等
@@ -77,7 +122,8 @@ module tb_egv_reader;
                 bleft <= bleft - 16'd1;
             end
         end else begin
-            i_sd_data       <= cur[7:0] + bcnt[7:0];
+            i_sd_data       <= (cur == `EGV_BASE_LBA) ? hdr_mem[bcnt] :
+                               (cur[7:0] + bcnt[7:0]);
             i_sd_data_valid <= 1'b1;
             if (bcnt == 9'd511) begin
                 bcnt          <= 9'd0;
@@ -130,10 +176,12 @@ module tb_egv_reader;
     endfunction
 
     always @(posedge clk) begin
-        if (!rst && busy && !started && o_sd_read && (bleft == 16'd0)) begin
+        if (!rst && !hdr_phase && busy && !started && o_sd_read && (bleft == 16'd0)) begin
+            // CMD18 批读：批长 = min(段剩余, 帧剩余)，正常帧一次命令读完
             if (o_sd_count !== exp_cnt(gsec)) begin
                 if (cnt_err < 5)
-                    $display("CNT ERR g=%0d got %0d exp %0d", gsec, o_sd_count, exp_cnt(gsec));
+                    $display("CNT ERR g=%0d got %0d exp %0d",
+                             gsec, o_sd_count, exp_cnt(gsec));
                 cnt_err = cnt_err + 1;
             end
             if (o_sd_addr !== exp_phys(gsec)) begin
@@ -147,13 +195,21 @@ module tb_egv_reader;
 
     always @(posedge clk) begin
         if (!rst && i_sd_read_end) begin
-            if (cur !== exp_phys(gsec)) begin
-                if (addr_err < 5)
-                    $display("ADDR ERR g=%0d got %0d exp %0d",
-                             gsec, cur, exp_phys(gsec));
-                addr_err = addr_err + 1;
+            if (hdr_phase) begin
+                if (cur !== `EGV_BASE_LBA || o_sd_count !== 16'd1) begin
+                    $display("HDR ERR: addr=%0d count=%0d", cur, o_sd_count);
+                    addr_err = addr_err + 1;
+                end
+                hdr_phase = 1'b0;
+            end else begin
+                if (cur !== exp_phys(gsec)) begin
+                    if (addr_err < 5)
+                        $display("ADDR ERR g=%0d got %0d exp %0d",
+                                 gsec, cur, exp_phys(gsec));
+                    addr_err = addr_err + 1;
+                end
+                gsec = gsec + 1;
             end
-            gsec = gsec + 1;
         end
     end
 
@@ -211,6 +267,7 @@ module tb_egv_reader;
     reg [31:0] ep;
     reg [7:0] exp_hi, exp_lo;
     initial begin
+        build_hdr;
         repeat (5) @(posedge clk);
         rst = 0;
         repeat (5) @(posedge clk);
@@ -302,6 +359,7 @@ module tb_egv_reader;
         play = 0;
         gsec = 0;                  // reader 从头重播，TB 逻辑扇区号同步归零
         repeat (10) @(posedge clk);
+        hdr_phase = 1;             // 重播会重新读一次容器头
         play = 1;
         k = 0;
         while (!dut.o_active && k < 200_000) begin @(posedge clk); k = k + 1; end

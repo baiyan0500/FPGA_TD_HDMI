@@ -8,7 +8,7 @@ module tb_ctrl;
     wire [1:0] layer, mode, viz;
     wire [2:0] bright, contrast;
     wire       next_en, auto_play, aud_pause;
-    wire       vplay, dmen, specen, rmen;
+    wire       vplay, dmen, specen, rmen, warnen;
 
     ctrl dut(
         .i_clk(clk), .i_rst(rst),
@@ -18,7 +18,8 @@ module tb_ctrl;
         .o_next_img_en(next_en), .o_auto_play(auto_play),
         .o_audio_pause(aud_pause), .o_viz_mode(viz),
         .o_video_play(vplay), .o_danmaku_en(dmen),
-        .o_spectrum_en(specen), .o_resmon_en(rmen)
+        .o_spectrum_en(specen), .o_resmon_en(rmen),
+        .o_warn_en(warnen)
     );
 
     always #1 clk = ~clk;
@@ -116,6 +117,16 @@ module tb_ctrl;
         sw = 4'b0001; #100;
         chk("L1 stops video", vplay, 0);
         chk("L1 layer", layer, 1);
+
+        // ---------------- SW4：独立最高优先级告警使能 ----------------
+        sw = 4'b1000; #100;
+        chk("SW4 alone layer", layer, 0);
+        chk("SW4 alone warn", warnen, 1);
+        sw = 4'b1001; #100;
+        chk("SW4+SW1 layer", layer, 1);
+        chk("SW4+SW1 warn", warnen, 1);
+        sw = 4'b0100; #100;
+        chk("SW4 off warn", warnen, 0);
 
         if (errs == 0) $display("TB_CTRL PASS");
         else           $display("TB_CTRL FAIL %0d", errs);

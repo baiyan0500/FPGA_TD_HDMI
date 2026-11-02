@@ -31,7 +31,7 @@ import imageio_ffmpeg
 import exfat_check
 
 SECTOR = 512
-MAX_RUNS = 8
+MAX_RUNS = 4  # 与 egv_reader 运行时段表深度一致（超过 4 段的文件在 RTL 侧按连续回退处理）
 RUN_OFF = 44
 
 

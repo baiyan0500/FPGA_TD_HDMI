@@ -71,6 +71,7 @@ wire        ctrl_video_play;
 wire        ctrl_danmaku_en;
 wire        ctrl_spectrum_en;      // 层3 频谱开关
 wire        ctrl_resmon_en;
+wire        ctrl_warn_en;          // SW4：最高优先级告警层
 wire [7:0]  audio_level;
 wire [191:0] spec_level;
 
@@ -116,7 +117,8 @@ wire [31:0] sd_card_write_data;
 wire        sd_card_write_req;
 wire        sd_card_write_req_ack;
 wire        frame_write_finish;
-reg         frame_write_toggle_mem;
+wire        bmp_fin_tgl;        // BMP 帧写完成 toggle
+wire        vf_fin_tgl;         // 视频帧写完成 toggle
 
 wire [1:0]  write_buf_idx;
 wire [1:0]  disp_buf_idx;
@@ -137,6 +139,7 @@ wire [7:0]  egv_cli_data;
 wire        egv_cli_end;
 wire        egv_found_sd;       // 扫描发现 EGV1 容器
 wire [31:0] egv_lba_sd;         // EGV1 起始扇区
+wire        wav_found_sd;       // 扫描发现 WAV 文件（菜单显示）
 
 wire        egv_pix_en;
 wire [15:0] egv_pix;
@@ -158,6 +161,8 @@ wire        vf_ready;
 wire        vf_frame_ready;
 wire        vf_busy;
 wire        vf_frame_end;
+wire        vf_frame_ok;
+wire [15:0] vf_pix_cnt;
 reg         vid_ftgl;
 
 wire        wr_ack_all;
@@ -299,19 +304,28 @@ PLL_HDMI_AUDIO u_audio_pll(
     .clk2_out   (audio_mclk)
 );
 
-// mem_clk 域把 write_finish 单拍转成 toggle，供 sd_card_clk 域可靠同步
-always @(posedge ext_mem_clk or posedge rst_all) begin
-    if (rst_all)
-        frame_write_toggle_mem <= 1'b0;
-    else if (frame_write_finish)
-        frame_write_toggle_mem <= ~frame_write_toggle_mem;
-end
+// 写完成按归属分流：BMP 装载与视频帧各用一路 toggle。
+// 旧版共用一路，BMP 后台装载完成会误翻视频显示缓冲 → 花屏/撕裂。
+wr_fin_split u_wr_fin_split (
+    .clk          (ext_mem_clk),
+    .rst          (rst_all),
+    .i_owner      (vid_wr_own),
+    .i_wr_ack     (wr_ack_all),
+    .i_wr_finish  (frame_write_finish),
+    .o_vf_tgl     (vf_fin_tgl),
+    .o_bmp_tgl    (bmp_fin_tgl)
+);
 
 // ===================== TF 多图扫描与缓存（双缓冲） =====================
 sd_card_bmp #(
     .CLK_FREQ_HZ       (100_000_000),
     .SCAN_START_SECTOR (32'd0),
-    .SCAN_MAX_SECTOR   (32'd131071),
+    // 扫描窗口从 64MB(131071) 扩到 128MB(262143)：实卡 VIDEO.EGV 被重新拷贝后
+    // 落在 LBA 143104（exFAT 分区基址 32768 + 簇堆 32768 + BMP/WAV 占位），
+    // 已越出旧窗口 → 扫不到 EGV1 魔数，运行时段表无从建立，回退的编译期
+    // LBA 47360 早已是空扇区 → egv_reader 判 M_NONE 拒播（面板 FRAME 00000、
+    // V:NG）。262143 是 img_sector 表 18bit 能表示的上限，再大需加宽段表。
+    .SCAN_MAX_SECTOR   (32'd262143),
     .SCAN_TARGET_COUNT (5'd16)
 ) sd_card_bmp_m0(
     .clk               (sd_card_clk),
@@ -323,11 +337,12 @@ sd_card_bmp #(
     .img_count         (img_count),
     .sd_ready          (sd_ready),
     .scan_done_o       (scan_done_sd),
+    .o_wav_found       (wav_found_sd),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
     .display_valid     (display_valid),
 
-    .write_finish_toggle(frame_write_toggle_mem),
+    .write_finish_toggle(bmp_fin_tgl),
     .write_buf_idx     (write_buf_idx),
     .disp_buf_idx      (disp_buf_idx),
     .fade_swap         (fade_swap),
@@ -436,22 +451,30 @@ always @(posedge video_clk or posedge rst_all) begin
         display_valid_s2 <= display_valid_s1;
     end
 end
-assign vout_data = (display_valid_s2 | vid_show) ? vout_data_raw : 24'd0;
+// 视频层选中时，显示有效只取决于"视频缓冲是否就绪"，不能并上图片层的
+// display_valid_s2：BMP 装载完成后 display_valid_s2 恒为 1，而视频层读的是
+// BUF2/BUF3 里还没被写过的 SDRAM 原始内容 → 启动/切层瞬间就是满屏彩电。
+// 非视频层仍按 display_valid_s2 判有效。
+assign vout_data = (vid_layer_v ? vid_show : display_valid_s2) ? vout_data_raw : 24'd0;
 
 // 启动状态跨域：100MHz 准静态电平 → video_clk 2 级同步
 reg        sd_ready_s1, sd_ready_s2;
 reg        scan_done_s1, scan_done_s2;
+reg        wav_found_s1, wav_found_s2;
 reg [4:0]  img_count_s1, img_count_s2;
 always @(posedge video_clk or posedge rst_all) begin
     if (rst_all) begin
         sd_ready_s1  <= 1'b0;  sd_ready_s2  <= 1'b0;
         scan_done_s1 <= 1'b0;  scan_done_s2 <= 1'b0;
+        wav_found_s1 <= 1'b0;  wav_found_s2 <= 1'b0;
         img_count_s1 <= 5'd0;  img_count_s2 <= 5'd0;
     end else begin
         sd_ready_s1  <= sd_ready;
         sd_ready_s2  <= sd_ready_s1;
         scan_done_s1 <= scan_done_sd;
         scan_done_s2 <= scan_done_s1;
+        wav_found_s1 <= wav_found_sd;
+        wav_found_s2 <= wav_found_s1;
         img_count_s1 <= img_count;
         img_count_s2 <= img_count_s1;
     end
@@ -460,17 +483,23 @@ end
 // 视频显示缓冲号 / 就绪标志跨域（100MHz → video_clk，准静态；读 FSM 在 vs 后锁存）
 reg vf_disp_bank_s1, vf_disp_bank_s2;
 reg vf_ready_s1, vf_ready_s2;
+reg vf_ok_s1, vf_ok_s2;
 always @(posedge video_clk or posedge rst_all) begin
     if (rst_all) begin
         vf_disp_bank_s1 <= 1'b0;
         vf_disp_bank_s2 <= 1'b0;
         vf_ready_s1     <= 1'b0;
         vf_ready_s2     <= 1'b0;
+        vf_ok_s1        <= 1'b0;
+        vf_ok_s2        <= 1'b0;
     end else begin
         vf_disp_bank_s1 <= vf_disp_bank;
         vf_disp_bank_s2 <= vf_disp_bank_s1;
         vf_ready_s1     <= vf_ready;
         vf_ready_s2     <= vf_ready_s1;
+        // 帧完整性自证位：100MHz 准静态（每帧更新一次），2 级同步足够
+        vf_ok_s1        <= vf_frame_ok;
+        vf_ok_s2        <= vf_ok_s1;
     end
 end
 // 视频缓冲黑场初始化完成前只出黑屏，避免上电 SDRAM 随机内容闪一下
@@ -574,12 +603,25 @@ ctrl u_ctrl(
     .o_video_play(ctrl_video_play),
     .o_danmaku_en(ctrl_danmaku_en),
     .o_spectrum_en(ctrl_spectrum_en),
-    .o_resmon_en(ctrl_resmon_en)
+    .o_resmon_en(ctrl_resmon_en),
+    .o_warn_en  (ctrl_warn_en)
 );
 
 assign vid_layer_v = (ctrl_layer == 2'd3);
 assign vid_play_v  = ctrl_video_play;
 assign vid_on_v    = vid_layer_v & vid_play_v;
+
+// 拨码实测电平跨域到 video_clk（准静态，2 级同步），供菜单右侧显示 SW 状态
+reg [3:0] sw_s1, sw_s2;
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        sw_s1 <= 4'd0;
+        sw_s2 <= 4'd0;
+    end else begin
+        sw_s1 <= sw;
+        sw_s2 <= sw_s1;
+    end
+end
 
 // ===================== 音频幅度提取 + 峰值保持（video_clk 域，与 I2S 接收输出同域）=====================
 reg [7:0]  audio_amp;
@@ -630,6 +672,7 @@ osd_layer u_osd_layer(
     .i_rgb      (trans_rgb),
     .i_bright   (ctrl_bright),
     .i_contrast (ctrl_contrast),
+    .i_sw       (sw_s2),
     .i_mode     (ctrl_mode),
     .i_slogan       (slogan_data),
     .i_slogan_len   (slogan_len),
@@ -648,15 +691,18 @@ osd_layer u_osd_layer(
     .o_dm_ack       (),
     .i_rm_en        (ctrl_resmon_en),
     .i_video_on     (vid_on_v),
+    .i_vok          (vf_ok_s2),
     .i_vid_ftgl     (vid_ftgl),
     .i_display_valid(display_valid_s2 | vid_show),
     .i_sd_init_done(sd_ready_s2),
     .i_scan_done(scan_done_s2),
     .i_img_count(img_count_s2),
+    .i_wav_found(wav_found_s2),
     .i_src_w_bcd(src_w_bcd),
     .i_src_h_bcd(src_h_bcd),
     .i_src_tgl(src_tgl),
     .i_auto_play(ctrl_auto_play),
+    .i_warn_en  (ctrl_warn_en),
     .o_hs       (),
     .o_vs       (osd_vs),
     .o_de       (osd_de),
@@ -773,12 +819,14 @@ video_frame_fill u_video_frame_fill (
     .o_wr_len         (vf_wr_len),
     .o_wr_bank        (vf_wr_bank),
     .o_addr_full      (vf_addr_full),
-    .i_fin_tgl        (frame_write_toggle_mem),
+    .i_fin_tgl        (vf_fin_tgl),
     .o_disp_bank      (vf_disp_bank),
     .o_ready          (vf_ready),
     .o_frame_ready    (vf_frame_ready),
     .o_busy           (vf_busy),
-    .o_frame_end      (vf_frame_end)
+    .o_frame_end      (vf_frame_end),
+    .o_frame_ok       (vf_frame_ok),
+    .o_pix_cnt        (vf_pix_cnt)
 );
 
 // 每写出一帧视频翻转一次（资源面板据此显示帧号）

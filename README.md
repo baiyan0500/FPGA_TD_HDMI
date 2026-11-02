@@ -6,9 +6,9 @@
 
 | 分类 | 功能 |
 |---|---|
-| 图片 | TF 卡 BMP 扫描（前 64MB、4KB 步进、最多 16 张）、任意分辨率≤1024×2047 最近邻缩放、双缓冲切换、手动/自动轮播 |
+| 图片 | TF 卡 BMP 扫描（前 128MB、4KB 步进、最多 16 张）、任意分辨率≤1024×2047 最近邻缩放、双缓冲切换、手动/自动轮播 |
 | 视频 | 640×480@60、HDMI 1.4b、25MHz 像素时钟；EGV 容器视频（320×148@24fps + 48kHz 音轨）2 倍放大居中播放 |
-| 音频 | WAV 16bit PCM、单/双声道、8k~48k、ASRC→48k、HDMI 音频、循环/暂停、测试音回退 |
+| 音频 | WAV PCM 16/24/32bit（含 `WAVE_FORMAT_EXTENSIBLE`）、单/双声道、8k~48k、ASRC→48k、HDMI 音频、循环/暂停、测试音回退 |
 | 显示增强 | 亮度/对比度 5 档（百分比显示）、4 种转场（淡入淡出/右擦除/左擦除/下滑） |
 | OSD | 上下信息栏、时间戳、开机启动面板、UART 标语滚动、音量峰值条、彩色弹幕、资源占用面板 |
 | 可视化 | 32 段 Goertzel 频谱（47Hz~16kHz），全宽透明叠加 |
@@ -49,8 +49,8 @@ src/td_project/HDMI1.4b_Transmitter_v1.0.al
 ### 2. 准备 TF 卡
 
 - 根目录放 BMP：24bit 非压缩，建议 640×480；工程支持任意 ≤1024×2047 分辨率缩放
-- 根目录放 WAV：16bit PCM、单/双声道、8k~48k（取扫描到的第一个 WAV，循环播放）
-- 根目录放 EGV 视频容器（可选）：用 `tools/video/mp4_to_egv.py` 生成；换视频须重新综合
+- 根目录放 WAV：PCM 16/24/32bit、单/双声道、8k~48k（取扫描到的第一个 WAV，循环播放）
+- 根目录放 EGV 视频容器（可选）：用 `tools/video/mp4_to_egv.py` 生成；换视频不必重新综合，但容器须在前 128MB 内且物理连续，可用 `node tools/video/egv_locate.js <盘号> VIDEO.EGV` 自检
 - FAT32 / exFAT 均可；使用 `doc/convert/sync_to_sd.py` 同步，避免物理扇区残留旧图
 
 详见 [图片与 TF 卡制作](docs/08-图片与TF卡制作.md)。
@@ -59,14 +59,15 @@ src/td_project/HDMI1.4b_Transmitter_v1.0.al
 
 按键/拨码映射、UART 标语协议见 [功能与操作](docs/04-功能与操作.md)。
 
-## 当前状态（2026-10-29）
+## 当前状态（2026-11-02）
 
-- 功能：基础 4/4、扩展 5/5 均已实现；本轮新增三层按键重规划、视频播放、弹幕、资源面板
-- 上板修复：WAV 头解析（卡内文件 fmt 后带 LIST 块，data 偏移 70 非 4 字节对齐）、视频客户端改扇区边界独占 + CMD18 连续读、`egv_reader` 段计数器 16→20 位（旧值把 385,024 扇区的 run1 饱和成 16,384）
-- 上板修复：读核 `S_WAIT_READ_WRITE` 采样过早锁存旧扇区号（结束脉冲到 `bmp_read` 经过 `rd_end_q`+`bmp_e_q` 两级寄存，客户端晚一拍更新地址）→ 每个扇区重发上一条 CMD17、扫描停在扇区 0、上电卡 `LOADING IMAGE`、视频层黑屏；补 `S_READ_WAIT2` 空等态，并给 `tb_sd_timing` 加 `+LAG` 客户端滞后模型守住该约束
-- 官方布局布线：Multi-Seed seed 3 完成，Setup +119ps / Hold +21ps / 0 FEPs，LUT 14491（73.93%）、8674 slices（88.51%）、54 RAM、19 DSP
-- bit：`HDMI1.4b_Transmitter_v1.0_sdaddr_seed3_setup119_hold21.bit`，见 `../bitstream/README.md`；待上板回归
-- 剩余：上板验证、演示收尾
+- 功能：基础 4/4、扩展 5/5 均已实现；图片 / 视频 / 音频 / 交互全部上板跑通
+- 上板修复（v20）：WAV 头解析（卡内文件 fmt 后带 LIST 块，data 偏移 70 非 4 字节对齐）；视频客户端改扇区边界独占 + CMD18 连续读；`egv_reader` 段计数器 16→20 位；读核 `S_WAIT_READ_WRITE` 采样过早补 `S_READ_WAIT2` 空等态
+- 上板修复（v21）：SPI MISO 采样点从"DCLK 翻转同拍"后移一拍，采在 25MHz 下 20ns 数据窗口正中，修偶发错字节导致的彩条与音频电流声；卡模型补 15ns tODLY
+- 上板修复（v22）：扫描窗口 64MB→128MB（`SCAN_MAX_SECTOR=262143`）。换卡后容器被拷到 LBA 143104，越出旧窗口且编译期回退地址已空 → `egv_reader` 判 `M_NONE` 拒播，面板 `FRAME 00000` + `V:NG`
+- 布局布线：v22 seed 2（Flow22 单进程 RTL→bitgen）Setup +12ps / Hold +22ps / 0 FEPs，LUT 16861（86.03%）、9567 slices（97.62%）、54 RAM、21 DSP
+- bit：`HDMI1.4b_Transmitter_v1.0_winscan_seed2_setup12_hold22.bit`，见 `../bitstream/README.md`；**已上板验证，功能全部正常**
+- 剩余：演示收尾、技术报告定稿
 
 ## 文档索引
 

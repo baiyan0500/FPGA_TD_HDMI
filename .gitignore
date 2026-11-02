@@ -21,6 +21,17 @@ sim/work/
 sim/work_*/
 sim/*.wlf
 sim/dump_seq.txt
+sim/*.vstf
+sim/*.hex
+sim/*.ppm
+sim/*.txt
+tools/video/*.hex
+tools/video/*.ppm
+# 调试抓帧图（osd_*.png 是文档引用的截图，需入库）
+tools/video/dbg_*.png
+tools/video/rf_*.png
+tools/video/rw_*.png
+tools/video/frame*.png
 
 # FPGA tool generated outputs
 src/td_project/log/

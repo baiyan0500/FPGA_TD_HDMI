@@ -143,6 +143,18 @@ assign wav_match = (riff_id0 == "R") && (riff_id1 == "I") &&
                    (riff_id2 == "F") && (riff_id3 == "F") &&
                    (wave_id0 == "W") && (wave_id1 == "A") &&
                    (wave_id2 == "V") && (wave_id3 == "E");
+// 判定结果同样打一拍：这些字节在扇区开头就锁存完毕，read_end 时
+// 寄存器输出早已稳定，扫描状态机的 CE 不再挂在跨区域的比较链上
+reg  wav_match_r, egv_match_r;
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        wav_match_r <= 1'b0;
+        egv_match_r <= 1'b0;
+    end else begin
+        wav_match_r <= wav_match;
+        egv_match_r <= egv_match;
+    end
+end
 assign src_width  = width[15:0];
 assign src_height = height[15:0];
 assign bmp_data_valid = (sd_sec_read_data_valid == 1'b1) &&
@@ -445,7 +457,7 @@ always @(posedge clk or posedge rst) begin
                         end
                         sd_sec_read_addr <= next_scan_sector_if_match;
                         scan_sector      <= next_scan_sector_if_match;
-                    end else if (wav_match) begin
+                    end else if (wav_match_r) begin
                         // WAV 文件：记录起始扇区，按 RIFF size 整体跳过
                         wav_found        <= 1'b1;
                         wav_start_sector <= scan_sector;
@@ -456,15 +468,25 @@ always @(posedge clk or posedge rst) begin
                         end
                         sd_sec_read_addr <= next_scan_sector_if_wav;
                         scan_sector      <= next_scan_sector_if_wav;
-                    end else if (egv_match && !egv_found) begin
+                    end else if (egv_match_r && !egv_found) begin
                         // EGV1 视频容器：首扇区即容器头，记录起始扇区后整段跳过。
                         // 容器可到 200MB，4KB 步进扫穿要十几秒，必须按长度跳。
+                        // 跳转点越过 scan_max 时不能就此收工：碎片化的卡上 WAV/后续
+                        // BMP 可能落在容器物理跨度内部的间隙里（实卡：EGV@47360，
+                        // WAV@58624 在容器段间隙），提前 scan_done 会让它们全部漏扫、
+                        // wav_found 永远为 0，音频只能播系统测试音。退化为 4KB 对齐
+                        // 步进继续扫，最多多 ~1s，保证窗口内文件都能被发现。
                         egv_found        <= 1'b1;
                         egv_start_sector <= scan_sector;
 
                         if (next_scan_sector_if_egv > scan_max_sector) begin
-                            scan_done <= 1'b1;
-                            state     <= ST_IDLE;
+                            if (scan_sector >= scan_max_sector) begin
+                                scan_done <= 1'b1;
+                                state     <= ST_IDLE;
+                            end else begin
+                                sd_sec_read_addr <= next_scan_sector_if_miss;
+                                scan_sector      <= next_scan_sector_if_miss;
+                            end
                         end else begin
                             sd_sec_read_addr <= next_scan_sector_if_egv;
                             scan_sector      <= next_scan_sector_if_egv;
