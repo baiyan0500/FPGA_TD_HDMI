@@ -1,5 +1,7 @@
 # EG4S20 HDMI 多媒体播放器（主工程）
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 基于安路 EG4S20BG256（HX4S20C）的纯 FPGA HDMI 音视频播放系统。TF 卡 BMP 图片经 SDRAM 双缓冲送 HDMI 显示，WAV 音频经 ASRC 与 I2S 嵌入 HDMI，叠加 OSD、转场、频谱与按键交互；TF 卡上另存一段 EGV 视频容器，可在视频层播放 320×148@24fps 画面与音轨。
 
 ## 功能清单
@@ -83,3 +85,36 @@ src/td_project/HDMI1.4b_Transmitter_v1.0.al
 | [08-图片与 TF 卡制作](docs/08-图片与TF卡制作.md) | 素材制作 |
 | [sim/README](sim/README.md) | 测试平台 |
 | [tools/README](tools/README.md) | 辅助工具 |
+
+## 许可证
+
+本项目以 **Apache License 2.0** 开源，全文见 [LICENSE](LICENSE)。
+
+```
+Copyright 2026 baiyan0500
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+要点：
+
+- 允许商用、修改、再分发、私用，需保留版权与许可声明，并对修改过的文件作出说明
+- 附带的专利授权条款；若发起专利诉讼则授权自动终止
+- 不提供任何担保
+
+**例外**：`doc/`、`docs/reference/` 下的安路（Anlogic）应用笔记、板卡手册与官方参考例程，以及 TD 工具链生成的文件，版权归原厂所有，不在 Apache 2.0 授权范围内，详见 [NOTICE](NOTICE)。
+
+## 贡献
+
+欢迎提 Issue / Pull Request。提交即表示同意以 Apache License 2.0 授权你的贡献。
+
